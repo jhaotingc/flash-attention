@@ -252,13 +252,23 @@ def _num_splits_sm90_native_fp8(
     num_splits, total_mblocks, num_n_blocks, num_SMs, two_ctas_fit, auto_splits
 ):
     """Clamp static splits to whole N tiles and one wave; with the auto heuristic and two
-    CTAs per SM, fill both CTA slots."""
+    CTAs per SM, fill both CTA slots, and for long KV pick the most splits (>= 32 blocks each)
+    whose last wave is at least 90% full."""
     if num_splits > 1:
         num_splits = min(num_splits, max(1, num_n_blocks), max(1, num_SMs // max(1, total_mblocks)))
     if auto_splits and two_ctas_fit:
         num_splits = max(
             num_splits, min(2 * num_SMs // max(1, total_mblocks), num_n_blocks // 4, 128)
         )
+        if num_n_blocks >= 96 and total_mblocks > 0:
+            slots = 2 * num_SMs
+            max_balanced_splits = min(2 * slots // total_mblocks, num_n_blocks // 32, 128)
+            for splits in range(max_balanced_splits, num_splits, -1):
+                active_ctas = total_mblocks * splits
+                waves = (active_ctas + slots - 1) // slots
+                if 10 * active_ctas >= 9 * waves * slots:
+                    num_splits = splits
+                    break
     return num_splits
 
 
