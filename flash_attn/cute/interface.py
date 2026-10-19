@@ -284,6 +284,26 @@ def _seqlen_k_loaded_sm90_native_fp8(
     return max(0, min(max_seqlen_k, right + left + 1 + tile_m))
 
 
+def _cluster_push_rows_sm90_native_fp8(
+    cluster_splits, packed_rows, tile_m, tile_n, head_dim, head_dim_v, ctas_per_sm
+):
+    """Rows exchanged by the st.async cluster-push combine, or 0 to fall back to the DSMEM-pull
+    combine when the receive buffer does not fit next to the K/V pipeline."""
+    if not cluster_splits:
+        return 0
+    rows = min(tile_m, packed_rows)
+    push_bytes = (
+        cluster_splits * ((rows + cluster_splits - 1) // cluster_splits) * (head_dim_v + 9) * 4 + 64
+    )
+    budget = _SM90_SMEM_PER_SM_BYTES // ctas_per_sm - _SM90_SMEM_RESERVED_PER_CTA_BYTES
+    return (
+        rows
+        if _smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, 2) + push_bytes
+        <= budget
+        else 0
+    )
+
+
 def _max_active_clusters_or_zero(cluster_size):
     try:
         return get_max_active_clusters(cluster_size)
@@ -1858,6 +1878,7 @@ def _flash_attn_fwd(
     )
     native_fp8_direct_3d_grid = native_fp8_one_m_block_per_batch and batch_size <= 65535
     native_fp8_ctas_per_sm = 1
+    native_fp8_push_rows = 0
     if native_fp8:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
             qhead_per_kvhead if pack_gqa else 1
@@ -1876,11 +1897,21 @@ def _flash_attn_fwd(
             num_ctas,
             get_num_sms_for_selection(device.index, arch),
         )
+        native_fp8_push_rows = _cluster_push_rows_sm90_native_fp8(
+            native_fp8_cluster_splits,
+            seqlen_q_rows,
+            tile_m,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            native_fp8_ctas_per_sm,
+        )
         compile_key += (
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
             native_fp8_ctas_per_sm,
             native_fp8_cluster_splits,
+            native_fp8_push_rows,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -2044,6 +2075,7 @@ def _flash_attn_fwd(
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
                 native_fp8_cluster_splits=native_fp8_cluster_splits,
+                native_fp8_push_rows=native_fp8_push_rows,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
