@@ -138,6 +138,35 @@ def _stmatrix_x4_b16(
     )
 
 
+@dsl_user_op
+def _ld_dsmem_f32(smem_addr: Int32, cta_rank: Int32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip), Int32(cta_rank).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b32 remote;\n\tmapa.shared::cluster.u32 remote, $1, $2;\n\tld.shared::cluster.f32 $0, [remote];\n\t}",
+            "=f,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_dsmem_f32x4(smem_addr: Int32, cta_rank: Int32, *, loc=None, ip=None):
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip), Int32(cta_rank).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b32 remote;\n\tmapa.shared::cluster.u32 remote, $4, $5;\n\tld.shared::cluster.v4.f32 {$0, $1, $2, $3}, [remote];\n\t}",
+        "=f,=f,=f,=f,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple((Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)))
+
+
 class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
     """Varlen scheduler for launches where every batch has exactly one M block (decode).
 
@@ -212,6 +241,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8_tma_box_n: Optional[int] = None,
         native_fp8_direct_3d_grid: bool = False,
         native_fp8_ctas_per_sm: int = 1,
+        native_fp8_cluster_splits: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -221,6 +251,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.native_fp8 = native_fp8
         self.direct_3d_grid = native_fp8 and native_fp8_direct_3d_grid
         self.ctas_per_sm = native_fp8_ctas_per_sm if native_fp8 else 1
+        self.cluster_splits = native_fp8_cluster_splits if native_fp8 and is_split_kv else 0
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )
@@ -567,9 +598,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             assert all(t.element_type == Float8E4M3FN for t in (mQ, mK, mV)), (
                 "native_fp8 requires E4M3 Q, K, and V"
             )
-            assert mO.element_type == (Float32 if self.is_split_kv else self.o_dtype), (
-                "native_fp8 writes the configured output dtype, or FP32 SplitKV partials"
-            )
+            assert mO.element_type == (
+                Float32 if self.is_split_kv and (not self.cluster_splits) else self.o_dtype
+            ), "native_fp8 writes the configured output dtype, or FP32 SplitKV partials"
             assert mLSE is None or mLSE.element_type == Float32
             assert all(
                 t is None or t.element_type == Int32
@@ -613,9 +644,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = layout_utils.select(mQ, Q_layout_transpose)
         num_splits = Int32(1)
-        if const_expr(not self.is_split_kv):
+        if const_expr(not self.is_split_kv or self.cluster_splits):
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+            if const_expr(self.cluster_splits):
+                num_splits = Int32(self.cluster_splits)
         else:
             O_layout_transpose = (
                 [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
@@ -901,6 +934,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=self.ctas_per_sm,
+            **dict(cluster=[1, self.cluster_splits, 1]) if const_expr(self.cluster_splits) else {},
         )
 
     @cute.kernel
@@ -1922,6 +1956,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     is_kv_load_warp,
                 )
                 q_producer_phase ^= 1
+            if const_expr(self.cluster_splits):
+                cute.arch.cluster_arrive_relaxed()
+                cute.arch.cluster_wait()
+                cute.arch.cluster_arrive_relaxed()
+                cute.arch.cluster_wait()
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -2660,25 +2699,159 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
-            self.epilogue(
-                acc_O,
-                softmax_tile.row_sum,
-                mO,
-                mLSE,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                tma_atom_O,
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                head_idx,
-                batch_idx,
-                split_idx,
-            )
+            if const_expr(self.cluster_splits):
+                self.epilogue_cluster_combine_native_fp8(
+                    acc_O,
+                    softmax_tile.row_sum,
+                    mO,
+                    mLSE,
+                    sQ,
+                    sV,
+                    seqlen,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    head_idx,
+                    batch_idx,
+                )
+            else:
+                self.epilogue(
+                    acc_O,
+                    softmax_tile.row_sum,
+                    mO,
+                    mLSE,
+                    sO,
+                    seqlen,
+                    gmem_tiled_copy_O,
+                    tma_atom_O,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    head_idx,
+                    batch_idx,
+                    split_idx,
+                )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def epilogue_cluster_combine_native_fp8(
+        self,
+        acc_O: cute.Tensor,
+        lse: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        sQ: cute.Tensor,
+        sV: cute.Tensor,
+        seqlen: SeqlenInfoQK,
+        tiled_mma: cute.TiledMma,
+        tidx: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+    ):
+        """Split-KV combine inside the cluster, pull variant (used when the push buffer does
+        not fit in shared memory): each split stages its normalized partial O / LSE in its own
+        drained V / Q shared memory, and after a cluster barrier every CTA reads all splits'
+        rows it owns over DSMEM and writes the merged output."""
+        num_splits = const_expr(self.cluster_splits)
+        vec = const_expr(4)
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
+        )
+        num_chunks = const_expr(self.tile_hdimv // vec)
+        o_row_stride = const_expr(
+            self.tile_hdimv + 8
+            if 2 * self.num_stages * self.tile_n * self.tile_hdimv
+            >= self.tile_m * (self.tile_hdimv + 8) * 4
+            else self.tile_hdimv
+        )
+        sOp = cute.make_tensor(
+            cute.make_ptr(Float32, sV.iterator.toint(), cute.AddressSpace.smem, assumed_align=16),
+            cute.make_layout((self.tile_m, self.tile_hdimv), stride=(o_row_stride, 1)),
+        )
+        sLSEp = cute.make_tensor(
+            cute.make_ptr(Float32, sQ.iterator.toint(), cute.AddressSpace.smem, assumed_align=16),
+            cute.make_layout(self.tile_m),
+        )
+        packed_rows = seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+        num_rows = cutlass.min(packed_rows - m_block * self.tile_m, self.tile_m)
+        thr_mma = tiled_mma.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        warp_row = (
+            tidx // self.num_threads_per_warp_group * 64
+            + tidx % self.num_threads_per_warp_group // cute.arch.WARP_SIZE * 16
+        )
+        if warp_row < num_rows:
+            taccOsO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(sOp))
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+            for r in cutlass.range_constexpr(cute.size(acc_O_mn, mode=[0])):
+                for c in cutlass.range_constexpr(cute.size(acc_O_mn, mode=[1])):
+                    taccOsO[r, c] = acc_O_mn[r, c]
+            if taccOcO[0, 0][1] == 0:
+                for r in cutlass.range_constexpr(cute.size(lse)):
+                    sLSEp[taccOcO[r, 0][0]] = lse[r]
+        cute.arch.cluster_arrive()
+        cute.arch.cluster_wait()
+        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+        mLSE_cur = None
+        if const_expr(mLSE is not None):
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
+        rank = cute.arch.block_idx_in_cluster()
+        o_base = Int32(sOp.iterator.toint())
+        lse_base = Int32(sLSEp.iterator.toint())
+        stride = const_expr(num_splits * self.num_mma_threads)
+        for item in cutlass.range(
+            rank * self.num_mma_threads + tidx, num_rows * num_chunks, stride, unroll=1
+        ):
+            row = item // num_chunks
+            col = (item - row * num_chunks) * vec
+            lse_split = cute.make_rmem_tensor(num_splits, Float32)
+            for s in cutlass.range_constexpr(num_splits):
+                lse_split[s] = _ld_dsmem_f32(lse_base + row * 4, s)
+            o_splits = [
+                _ld_dsmem_f32x4(o_base + (row * o_row_stride + col) * 4, s)
+                for s in range(num_splits)
+            ]
+            lse_max = lse_split[0]
+            for s in cutlass.range_constexpr(1, num_splits):
+                lse_max = cute.arch.fmax(lse_max, lse_split[s])
+            lse_max = Float32(0.0) if lse_max == -Float32.inf else lse_max
+            sum_exp = Float32(0.0)
+            for s in cutlass.range_constexpr(num_splits):
+                lse_split[s] = cute.math.exp(lse_split[s] - lse_max, fastmath=True)
+                sum_exp += lse_split[s]
+            inv_sum = Float32(0.0) if sum_exp == 0.0 else cute.arch.rcp_approx(sum_exp)
+            o_acc = cute.make_rmem_tensor(vec, Float32)
+            o_acc.fill(0.0)
+            for s in cutlass.range_constexpr(num_splits):
+                w = lse_split[s] * inv_sum
+                for j in cutlass.range_constexpr(vec):
+                    o_acc[j] += w * o_splits[s][j]
+            prow = m_block * self.tile_m + row
+            o_out = cute.make_rmem_tensor(vec, mO.element_type)
+            o_out.store(o_acc.load().to(mO.element_type))
+            gO_vec = cute.make_tensor(
+                cute.make_ptr(
+                    mO.element_type,
+                    utils.elem_pointer(mO_cur, (prow, col)).toint(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec * mO.element_type.width // 8,
+                ),
+                cute.make_layout(vec),
+            )
+            cute.autovec_copy(o_out, gO_vec)
+            if const_expr(mLSE is not None):
+                if col == 0:
+                    mLSE_cur[prow] = (
+                        lse_max + cute.math.log(sum_exp, fastmath=True)
+                        if sum_exp > 0.0
+                        else -Float32.inf
+                    )
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
 
     @cute.jit
     def first_half_block_overlap(

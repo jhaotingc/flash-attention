@@ -29,6 +29,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
+    get_max_active_clusters,
     get_aux_tensor_metadata,
     get_broadcast_dims,
     get_num_sms_for_selection,
@@ -281,6 +282,70 @@ def _seqlen_k_loaded_sm90_native_fp8(
     right = window_size_right if window_size_right is not None else max_seqlen_k
     left = window_size_left if window_size_left is not None else max_seqlen_k
     return max(0, min(max_seqlen_k, right + left + 1 + tile_m))
+
+
+def _max_active_clusters_or_zero(cluster_size):
+    try:
+        return get_max_active_clusters(cluster_size)
+    except Exception:
+        return 0
+
+
+def _cluster_fits_one_wave_sm90_native_fp8(cluster_size, total_mblocks, two_ctas_fit, num_SMs):
+    """All tiles' clusters of this size are co-resident (one wave of active clusters)."""
+    shared_sm = two_ctas_fit and total_mblocks * cluster_size > num_SMs
+    return total_mblocks <= _max_active_clusters_or_zero(cluster_size) * (2 if shared_sm else 1)
+
+
+def _cluster_splits_sm90_native_fp8(
+    num_splits, total_mblocks, num_n_blocks, tile_n, head_dim, head_dim_v, two_ctas_fit, num_SMs
+):
+    """Split count for running each tile's splits as one thread block cluster (<= 16 CTAs)
+    whose partial outputs are merged on-chip, or 0 to keep separate splits plus the combine
+    kernel. Takes the largest cluster that fits in one wave as long as the extra K/V each CTA
+    streams over the default split count stays small."""
+    base_blocks = (num_n_blocks + num_splits - 1) // num_splits
+    for cluster_size in range(min(16, num_splits, num_n_blocks), 1, -1):
+        if not _cluster_fits_one_wave_sm90_native_fp8(
+            cluster_size, total_mblocks, two_ctas_fit, num_SMs
+        ):
+            continue
+        blocks = (num_n_blocks + cluster_size - 1) // cluster_size
+        shared_sm = two_ctas_fit and total_mblocks * cluster_size > num_SMs
+        budget = (54 if shared_sm else 108) * 1024
+        if (blocks - base_blocks) * tile_n * (head_dim + head_dim_v) > budget:
+            return 0
+        smallest = (num_n_blocks + blocks - 1) // blocks
+        if smallest < cluster_size and _cluster_fits_one_wave_sm90_native_fp8(
+            smallest, total_mblocks, two_ctas_fit, num_SMs
+        ):
+            cluster_size = smallest
+        return _balanced_cluster_splits_sm90_native_fp8(
+            cluster_size, total_mblocks, num_n_blocks, num_SMs
+        )
+    return 0
+
+
+def _balanced_cluster_splits_sm90_native_fp8(cluster_size, total_mblocks, num_n_blocks, num_SMs):
+    """Between one and two waves of SMs, prefer a smaller cluster that runs in one CTA per SM
+    unless it doubles the KV blocks per CTA."""
+    if not num_SMs < total_mblocks * cluster_size < 2 * num_SMs:
+        return cluster_size
+    for one_cta_size in range(min(16, num_SMs // max(1, total_mblocks), num_n_blocks), 1, -1):
+        if total_mblocks <= _max_active_clusters_or_zero(one_cta_size):
+            if (num_n_blocks + one_cta_size - 1) // one_cta_size < 2 * (
+                (num_n_blocks + cluster_size - 1) // cluster_size
+            ):
+                return one_cta_size
+            break
+    return cluster_size
+
+
+def _cluster_pull_fits_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+    """The DSMEM-pull cluster combine stages the tile's FP32 partial O in the drained sV and
+    sVLoad buffers (2 * num_stages * tile_n * hdim_v bytes, with the 2-stage K/V ring). Allow
+    cluster split-KV only when that fits."""
+    return tile_m * head_dim_v * 4 <= 2 * 2 * tile_n * head_dim_v
 
 
 @dataclass(frozen=True)
@@ -1306,7 +1371,38 @@ def _flash_attn_fwd(
         num_splits = decode_splits[1]
 
     is_split_kv = num_splits > 1
-    if is_split_kv:
+    # SM90 native FP8 split-KV: run each tile's splits as one thread block cluster and merge
+    # the partial outputs on-chip, without FP32 partials or the combine kernel.
+    native_fp8_cluster_splits = 0
+    if (
+        native_fp8
+        and num_splits > 1
+        and (not use_block_sparsity)
+        and isinstance(max_seqlen_k, int)
+        and _cluster_pull_fits_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v)
+    ):
+        packed_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
+            qhead_per_kvhead if pack_gqa else 1
+        )
+        seqlen_k_loaded = _seqlen_k_loaded_sm90_native_fp8(
+            max_seqlen_k, local, window_size_left, window_size_right, tile_m
+        )
+        native_fp8_cluster_splits = _cluster_splits_sm90_native_fp8(
+            num_splits,
+            batch_size
+            * (num_head_kv if pack_gqa else num_head)
+            * ((packed_rows + tile_m - 1) // tile_m),
+            (seqlen_k_loaded + tile_n - 1) // tile_n,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v),
+            get_num_sms_for_selection(device.index, arch),
+        )
+        if native_fp8_cluster_splits:
+            num_splits = native_fp8_cluster_splits
+            is_split_kv = True
+    if is_split_kv and (not native_fp8_cluster_splits):
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
             (num_splits, lse_shape[1], lse_shape[0]) if use_sparse_decode
@@ -1784,6 +1880,7 @@ def _flash_attn_fwd(
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
             native_fp8_ctas_per_sm,
+            native_fp8_cluster_splits,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1817,10 +1914,11 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
+        partials = is_split_kv and (not native_fp8_cluster_splits)
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            to_cute_tensor(t) for t in (q, k, v, out_partial if partials else out)
         ]
-        if is_split_kv:
+        if partials:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
@@ -1945,6 +2043,7 @@ def _flash_attn_fwd(
                 native_fp8_tma_box_n=native_fp8_tma_box_n,
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
+                native_fp8_cluster_splits=native_fp8_cluster_splits,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -2236,12 +2335,13 @@ def _flash_attn_fwd(
                 window_size_right,
             )
         else:
+            partials = is_split_kv and (not native_fp8_cluster_splits)
             call_args = [
                 q_call,
                 k_call,
                 v_call,
-                out_call if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
+                out_partial if partials else out_call,
+                lse_partial if partials else lse,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -2294,7 +2394,7 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
-    if is_split_kv:
+    if is_split_kv and (not native_fp8_cluster_splits):
         if use_sparse_decode:
             # decode partials are per token row: one batch of length total_q, no cu_seqlens
             _flash_attn_fwd_combine(
