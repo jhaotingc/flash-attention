@@ -150,6 +150,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8: bool = False,
         native_fp8_o_dtype=None,
         native_fp8_tma_box_n: Optional[int] = None,
+        native_fp8_ctas_per_sm: int = 1,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -157,6 +158,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.native_fp8 = native_fp8
+        self.ctas_per_sm = native_fp8_ctas_per_sm if native_fp8 else 1
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )
@@ -606,6 +608,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_mma_regs = 232 if const_expr(self.use_tma_Q and self.use_tma_KV) else 224
         if const_expr(self.transpose_v_in_producer and self.num_wg_mma == 3):
             self.num_mma_regs, self.num_producer_regs = (152, 56)
+        if const_expr(self.ctas_per_sm == 2):
+            assert self.num_wg_mma == 1, "two CTAs per SM need a single MMA warpgroup"
+            self.num_mma_regs, self.num_producer_regs = (200, 56)
         self.rescale_O_before_gemm = (
             self.tile_hdimv > 128 and self.intra_wg_overlap and not self.native_fp8
         )
@@ -829,7 +834,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=self.ctas_per_sm,
         )
 
     @cute.kernel
