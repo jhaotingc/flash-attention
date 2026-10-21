@@ -3098,6 +3098,89 @@ def test_flash_attn_fp8_qkv_decode_launch_sm90(
     assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
 
 
+# (head dim, value head dim, q heads, kv heads, (query tokens, KV length) per request, window,
+# page size). Varlen prefill and mixed batches: the direct (head, split, m_block x batch) grid,
+# the generic varlen scheduler when padding to the longest request would more than double the
+# grid, and the d192/dv128 overlapped mainloop with 128- and (one wave) 64-row tiles.
+_SM90_FP8_PREFILL_LAUNCH_CASES = [
+    pytest.param(64, 64, 8, 8, ((512, 512), (300, 800)), 0, 64, id="d64-mha"),
+    pytest.param(96, 96, 16, 4, ((1024, 2048), (64, 64)), 0, 16, id="d96-gqa"),
+    pytest.param(128, 128, 32, 8, ((2048, 6144),), 0, 16, id="d128-q2k-k6k"),
+    pytest.param(
+        128, 128, 32, 8, ((2048, 2048), (16, 4096), (16, 4096), (16, 4096)), 0, 16, id="d128-mixed"
+    ),
+    pytest.param(192, 128, 16, 4, ((1024, 4096), (512, 4096)), 0, 64, id="d192-dv128-gqa"),
+    pytest.param(192, 128, 16, 1, ((64, 1024),), 128, 64, id="d192-dv128-mqa-w128"),
+    pytest.param(256, 256, 8, 4, ((2048, 8192),), 1024, 64, id="d256-w1024"),
+]
+
+
+@pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
+@pytest.mark.parametrize(
+    "d, dv, nheads, nheads_k, seqlens, window, page_size", _SM90_FP8_PREFILL_LAUNCH_CASES
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_qkv_prefill_launch_sm90(
+    d, dv, nheads, nheads_k, seqlens, window, page_size
+):
+    """SM90 FP8 Q/K/V varlen prefill and mixed batches over paged K/V, with vLLM-style arguments
+    (cu_seqlens_q, per-request KV lengths, default split heuristic), against an fp32 reference."""
+    device, fp8 = "cuda", torch.float8_e4m3fn
+    torch.random.manual_seed(0)
+    batch_size = len(seqlens)
+    q_lens = [s for s, _ in seqlens]
+    k_lens = [s for _, s in seqlens]
+    max_k = max(k_lens)
+    q = (torch.randn(sum(q_lens), nheads, d, device=device) * 0.5).to(fp8)
+    num_pages = (max_k + page_size - 1) // page_size
+    num_blocks = batch_size * num_pages
+    k_paged = (torch.randn(num_blocks, page_size, nheads_k, d, device=device) * 0.5).to(fp8)
+    v_paged = (torch.randn(num_blocks, page_size, nheads_k, dv, device=device) * 0.5 + 0.5).to(fp8)
+    page_table = rearrange(
+        torch.randperm(num_blocks, dtype=torch.int32, device=device), "(b n) -> b n", b=batch_size
+    )
+    cu_seqlens_q = torch.tensor(
+        [0] + list(itertools.accumulate(q_lens)), dtype=torch.int32, device=device
+    )
+    seqused_k = torch.tensor(k_lens, dtype=torch.int32, device=device)
+    window_size = (window - 1, 0) if window else (None, None)
+
+    out, *_ = _flash_attn_fwd(
+        q,
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seqused_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max_k,
+        page_table=page_table,
+        causal=True,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        num_splits=0,
+    )
+    if is_fake_mode():
+        return
+
+    gather = lambda paged: rearrange(
+        paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
+    ).float()
+    k_ref, v_ref = gather(k_paged), gather(v_paged)
+    errs, refs = [], []
+    for b, (sq, sk) in enumerate(seqlens):
+        q_b = q[cu_seqlens_q[b] : cu_seqlens_q[b + 1]].float()[None]
+        out_ref, _ = attention_ref(
+            q_b, k_ref[b : b + 1, :sk], v_ref[b : b + 1, :sk], causal=True, window_size=window_size
+        )
+        errs.append((out[cu_seqlens_q[b] : cu_seqlens_q[b + 1]].float()[None] - out_ref).flatten())
+        refs.append(out_ref.flatten())
+    err, ref = torch.cat(errs), torch.cat(refs)
+    err_mean, ref_mean = err.abs().mean().item(), ref.abs().mean().item()
+    print(f"Output mean |err| {err_mean:.3e}, mean |ref| {ref_mean:.3e}")
+    assert err_mean <= 0.01 * ref_mean
+    assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
+
+
 @pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(

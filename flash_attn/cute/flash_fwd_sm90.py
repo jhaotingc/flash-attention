@@ -52,10 +52,14 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
 
 
-def _use_intra_wg_overlap_sm90(intra_wg_overlap, native_fp8):
-    # Native FP8 runs the non-overlapped mainloop: its two-level PV accumulation keeps a second
-    # O accumulator in registers, which leaves no room for the next tile's scores.
-    return intra_wg_overlap and not native_fp8
+def _use_intra_wg_overlap_sm90(intra_wg_overlap, native_fp8, head_dim=None, head_dim_v=None):
+    # Native FP8 keeps a second O accumulator in registers for its two-level PV accumulation, so
+    # overlapping the next tile's QK GEMM with PV also has to hold that tile's scores. That
+    # spills at d128 (8-12% slower long prefills) and does not pay at d96; at (192, 128) it fits
+    # and is faster. head_dim / head_dim_v are given only for kernels with one CTA per SM.
+    return intra_wg_overlap and (
+        not native_fp8 or (head_dim is not None and head_dim == 192 and head_dim_v == 128)
+    )
 
 
 def _convert_layout_acc_frgA_fp8(acc_layout: cute.Layout) -> cute.Layout:
@@ -85,20 +89,43 @@ def _convert_layout_acc_frgA_fp8(acc_layout: cute.Layout) -> cute.Layout:
     )
 
 
+@dsl_user_op
+def _cvt_e4m3x4_f32(a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None) -> Int32:
+    """Round four f32 values to E4M3 (nearest, saturating); pack them with a in the low byte."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b, c, d)],
+            "{\n\t.reg .b16 lo, hi;\n\tcvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n\tmov.b32 $0, {lo, hi};\n\t}\n",
+            "=r,f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 @cute.jit
-def _permute_Aregs_fp8(frag: cute.Tensor) -> None:
-    """Pack converted E4M3 probabilities into FP8 PV A registers.
+def _cvt_permute_Aregs_fp8(src: cute.Tensor, frag: cute.Tensor) -> None:
+    """Convert f32 probabilities to E4M3 straight into the FP8 PV A registers.
 
     The producer writes V^T with LDSM.T/STSM in the same permuted K order as the score
-    accumulator, so each thread only regroups bytes within its own registers.
+    accumulator, so each 32-bit A register holds values (0, 1, 4, 5) or (2, 3, 6, 7) of an
+    8-value group of the accumulator. Converting into that order directly replaces a full-tile
+    f32 -> E4M3 conversion followed by byte permutes.
     """
     assert frag.element_type == Float8E4M3FN
     assert frag.shape[0][0] == 4 and frag.shape[0][1] == 2
+    assert cute.size(src) == cute.size(frag) and cute.size(src) % 8 == 0
     frag_i32 = cute.recast_tensor(frag, Int32)
-    for i in cutlass.range(cute.size(frag_i32) // 2, unroll_full=True):
-        cols_lo, cols_hi = (frag_i32[2 * i], frag_i32[2 * i + 1])
-        frag_i32[2 * i] = cute.arch.prmt(cols_lo, cols_hi, Int32(0x5410))
-        frag_i32[2 * i + 1] = cute.arch.prmt(cols_lo, cols_hi, Int32(0x7632))
+    for i in cutlass.range_constexpr(cute.size(frag_i32) // 2):
+        frag_i32[2 * i] = _cvt_e4m3x4_f32(
+            src[8 * i], src[8 * i + 1], src[8 * i + 4], src[8 * i + 5]
+        )
+        frag_i32[2 * i + 1] = _cvt_e4m3x4_f32(
+            src[8 * i + 2], src[8 * i + 3], src[8 * i + 6], src[8 * i + 7]
+        )
 
 
 @dsl_user_op
@@ -195,6 +222,83 @@ class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
         return scheduler
 
 
+class MultiMBlockVarlenScheduler(SingleMBlockVarlenScheduler):
+    """Varlen scheduler for prefill launched as a direct (head, split, m_block x batch) grid.
+
+    Like SingleMBlockVarlenScheduler, each CTA decodes its tile from blockIdx instead of
+    searching the cumulative M-block counts. The grid has one M block slot per
+    ceil(max_seqlen_q x q heads per KV head / tile_m) for every request; slots past a
+    request's real length are invalid tiles that exit at once. With lpt the M blocks run in
+    reverse order, so the longest (causal: most expensive) blocks start first.
+    """
+
+    @staticmethod
+    @cute.jit
+    def create(params, ctx=None, *, loc=None, ip=None) -> "MultiMBlockVarlenScheduler":
+        head_idx, split_idx, mb_batch_idx = cute.arch.block_idx()
+        d = params.decoder
+        m_block = mb_batch_idx // d.num_batch
+        batch_idx = mb_batch_idx - m_block * d.num_batch
+        if const_expr(d.lpt):
+            m_block = cute.arch.grid_dim()[2] // d.num_batch - 1 - m_block
+        return MultiMBlockVarlenScheduler(
+            params, head_idx, batch_idx, split_idx, m_block, loc=loc, ip=ip
+        )
+
+    def __init__(
+        self,
+        params,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        m_block: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        super().__init__(params, head_idx, batch_idx, split_idx, loc=loc, ip=ip)
+        self._m_block = m_block
+
+    @staticmethod
+    def get_grid_shape(params, num_m_blocks: Int32, *, loc=None, ip=None):
+        d = params.decoder
+        return (d.num_head, d.num_splits, d.num_batch * num_m_blocks)
+
+    @cute.jit
+    def _decode_work_tile(self) -> WorkTileInfo:
+        d = self.params.decoder
+        split_idx = self._split_idx if const_expr(d.is_split_kv) else Int32(0)
+        seqlen_q = d.mCuSeqlensQ[self._batch_idx + 1] - d.mCuSeqlensQ[self._batch_idx]
+        is_valid = (
+            self._is_first_block
+            and self._m_block * d.tile_shape_mn[0] < seqlen_q * d.qhead_per_kvhead_packgqa
+        )
+        return WorkTileInfo(
+            (Int32(self._m_block), Int32(self._head_idx), Int32(self._batch_idx), Int32(split_idx)),
+            is_valid,
+        )
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = ([], [])
+        for obj in (self.params, self._head_idx, self._batch_idx, self._split_idx, self._m_block):
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            (self.params, self._head_idx, self._batch_idx, self._split_idx, self._m_block),
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        scheduler = MultiMBlockVarlenScheduler(*obj_list, loc=self._loc)
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
+
+
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def __init__(
         self,
@@ -210,6 +314,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8_tma_box_n: Optional[int] = None,
         native_fp8_direct_3d_grid: bool = False,
         native_fp8_ctas_per_sm: int = 1,
+        native_fp8_direct_m_blocks: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -217,7 +322,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             f"Fused quant output not implemented for {type(self).__name__}"
         )
         self.native_fp8 = native_fp8
+        # Direct grids read the tile from blockIdx: (head, split, batch) for decode, one M block
+        # per request; (head, split, m_block x batch) for prefill (MultiMBlockVarlenScheduler).
         self.direct_3d_grid = native_fp8 and native_fp8_direct_3d_grid
+        self.direct_m_blocks = native_fp8 and native_fp8_direct_m_blocks
         self.ctas_per_sm = native_fp8_ctas_per_sm if native_fp8 else 1
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
@@ -227,7 +335,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 "native_fp8_o_dtype must be Float16 or BFloat16"
             )
             self.o_dtype = native_fp8_o_dtype
-        self.intra_wg_overlap = _use_intra_wg_overlap_sm90(intra_wg_overlap, self.native_fp8)
+        self.intra_wg_overlap = _use_intra_wg_overlap_sm90(
+            intra_wg_overlap,
+            self.native_fp8,
+            *((self.tile_hdim, self.tile_hdimv) if self.ctas_per_sm == 1 else (None, None)),
+        )
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
@@ -551,6 +663,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
+        # Native FP8 direct m-block grid only: the longest request's query length sizes the
+        # grid. It follows stream so that every other launch's argument list is unchanged;
+        # TVM FFI passes the environment stream implicitly, wherever it sits.
+        max_seqlen_q: Int32 | int | None = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -804,6 +920,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.direct_3d_grid and mSeqUsedQ is None)
                 else SingleTileVarlenScheduler
             )
+            if const_expr(
+                self.direct_m_blocks and mSeqUsedQ is None and max_seqlen_q is not None
+            ):
+                TileScheduler = MultiMBlockVarlenScheduler
         else:
             TileScheduler = (
                 SingleTileScheduler
@@ -837,7 +957,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
-        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+        if const_expr(TileScheduler is MultiMBlockVarlenScheduler):
+            # One slot per M block of the longest request, for every request.
+            grid_dim = TileScheduler.get_grid_shape(
+                tile_sched_params,
+                cute.ceil_div(
+                    Int32(max_seqlen_q)
+                    * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1),
+                    self.tile_m,
+                ),
+            )
+        else:
+            grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
@@ -964,10 +1095,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
-        # Decode with a direct (head, split, batch) grid: read the first tile's seqlens before
-        # the barrier setup so their global-memory latency overlaps it.
+        # Direct grids (decode: (head, split, batch); prefill: (head, split, m_block x batch)):
+        # read the first tile's seqlens before the barrier setup so their global-memory latency
+        # overlaps it.
         self._seqlen_first = None
-        if const_expr(self.native_fp8 and TileScheduler is SingleMBlockVarlenScheduler):
+        if const_expr(
+            self.native_fp8
+            and (
+                TileScheduler is SingleMBlockVarlenScheduler
+                or TileScheduler is MultiMBlockVarlenScheduler
+            )
+        ):
             _, _, first_batch, _ = (
                 TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
             )
@@ -2335,6 +2473,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax_scale=softmax_scale,
             max_offset=native_fp8_max_offset,
         )
+        # Native FP8 with intra-warpgroup overlap (d192/dv128, see _use_intra_wg_overlap_sm90):
+        # the PV GEMM of tile i-1 runs under the QK GEMM and softmax of tile i into acc_O_pv,
+        # and is folded into acc_O with the row scale of its own tile (scale_pending).
+        native_overlap = const_expr(self.native_fp8 and self.intra_wg_overlap)
+        scale_pending = (
+            cute.make_rmem_tensor_like(softmax.row_max, Float32)
+            if const_expr(native_overlap)
+            else None
+        )
 
         # For RescaleOBeforeGemm: persistent scores_scale across iterations
         scores_scale = None
@@ -2347,7 +2494,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.mma_one_n_block_intrawg_overlap_fp8
             if const_expr(self.fp8_kv_dequant)
             else (
-                self.mma_one_n_block_intrawg_overlap
+                self.mma_one_n_block_intrawg_overlap_native_fp8
+                if const_expr(native_overlap)
+                else self.mma_one_n_block_intrawg_overlap
                 if const_expr(self.intra_wg_overlap)
                 else self.mma_one_n_block
             ),
@@ -2361,12 +2510,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
             **(dict(acc_O_pv=acc_O_pv) if const_expr(self.native_fp8) else {}),
+            **(dict(scale_pending=scale_pending) if const_expr(native_overlap) else {}),
         )
 
         process_first_half_block = partial(
             self.first_half_block_overlap_fp8
             if const_expr(self.fp8_kv_dequant)
-            else self.first_half_block_overlap,
+            else (
+                self.first_half_block_overlap_native_fp8
+                if const_expr(native_overlap)
+                else self.first_half_block_overlap
+            ),
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
             tOrP=tOrP,
@@ -2374,16 +2528,26 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             acc_O=acc_O,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
+            **(dict(scale_pending=scale_pending) if const_expr(native_overlap) else {}),
         )
         process_last_half_block = partial(
             self.last_half_block_overlap_fp8
             if const_expr(self.fp8_kv_dequant)
-            else self.last_half_block_overlap,
+            else (
+                self.last_half_block_overlap_native_fp8
+                if const_expr(native_overlap)
+                else self.last_half_block_overlap
+            ),
             pipeline_v=pipeline_v,
             mma_pv_fn=mma_pv_fn,
             scores_scale=scores_scale,
             acc_O=acc_O,
             **(dict(dequant_params=dequant_params) if const_expr(self.fp8_kv_dequant) else {}),
+            **(
+                dict(acc_O_pv=acc_O_pv, scale_pending=scale_pending)
+                if const_expr(native_overlap)
+                else {}
+            ),
         )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
@@ -2749,6 +2913,119 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 acc_O[h * n + i] = acc_O[h * n + i] + acc_O_half[i]
 
     @cute.jit
+    def _fold_o_native_fp8(self, acc_O: cute.Tensor, acc_O_pv: cute.Tensor, row_scale: cute.Tensor):
+        """Two-level PV accumulation: acc_O = acc_O * row_scale + acc_O_pv, row by row."""
+        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+        acc_O_pv_mn = layout_utils.reshape_acc_to_mn(acc_O_pv)
+        for r in cutlass.range(cute.size(row_scale), unroll_full=True):
+            acc_O_mn[r, None].store(
+                acc_O_mn[r, None].load() * row_scale[r] + acc_O_pv_mn[r, None].load()
+            )
+
+    @cute.jit
+    def first_half_block_overlap_native_fp8(
+        self,
+        n_block: Int32,
+        mma_qk_fn: Callable,
+        kv_consumer_state,
+        pipeline_k,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
+        acc_O: Optional[cute.Tensor] = None,
+        mask_fn: Callable = None,
+        score_mod_fn: Optional[Callable] = None,
+        is_first_block: bool = False,
+        scale_pending: Optional[cute.Tensor] = None,
+    ):
+        """First KV block of the native FP8 overlapped mainloop: QK GEMM, mask and softmax; P goes
+        to the A registers and its row scale to scale_pending (its PV runs in the next step).
+        """
+        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
+        acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
+        pipeline_k.consumer_release(kv_consumer_state)
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
+        row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+        _cvt_permute_Aregs_fp8(self._scores_to_pv_fragment(acc_S), tOrP)
+        scale_pending.store(row_scale.load())
+        return kv_consumer_state
+
+    @cute.jit
+    def mma_one_n_block_intrawg_overlap_native_fp8(
+        self,
+        smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
+        n_block: Int32,
+        mma_qk_fn: Callable,
+        mma_pv_fn: Callable,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        acc_O: cute.Tensor,
+        tOrP: cute.Tensor,
+        smem_copy_params: SimpleNamespace,
+        softmax: Softmax,
+        seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
+        score_mod_fn: Optional[Callable] = None,
+        mask_fn: Optional[Callable] = None,
+        check_inf: cutlass.Constexpr = True,
+        acc_O_pv: Optional[cute.Tensor] = None,
+        scale_pending: Optional[cute.Tensor] = None,
+    ):
+        """One KV block of the native FP8 overlapped mainloop.
+
+        Issues the QK GEMM of block n and the PV GEMM of block n + 1 (P from the previous step)
+        into acc_O_pv from zero, runs block n's softmax under them, then folds acc_O_pv into acc_O
+        with the row scale of the block it belongs to (scale_pending) and keeps block n's scale
+        for the next fold. At most one KV block accumulates in acc_O_pv (two-level).
+        """
+        smem_pipe_read_v = smem_pipe_read.clone()
+        smem_pipe_read.advance()
+        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        self.warp_scheduler_barrier_sync()
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+        self.warp_scheduler_barrier_arrive()
+        warpgroup.wait_group(1)
+        pipeline_k.consumer_release(smem_pipe_read)
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S=acc_S, n_block=n_block)
+        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        warpgroup.wait_group(0)
+        pipeline_v.consumer_release(smem_pipe_read_v)
+        self._fold_o_native_fp8(acc_O, acc_O_pv, scale_pending)
+        scale_pending.store(row_scale.load())
+        _cvt_permute_Aregs_fp8(self._scores_to_pv_fragment(acc_S), tOrP)
+        return smem_pipe_read
+
+    @cute.jit
+    def last_half_block_overlap_native_fp8(
+        self,
+        kv_consumer_state,
+        pipeline_v,
+        mma_pv_fn: Callable,
+        zero_init: bool,
+        scores_scale: Optional[cute.Tensor] = None,
+        softmax: Optional[Softmax] = None,
+        acc_O: Optional[cute.Tensor] = None,
+        acc_O_pv: Optional[cute.Tensor] = None,
+        scale_pending: Optional[cute.Tensor] = None,
+    ):
+        """Last PV GEMM of the native FP8 overlapped mainloop, folded with scale_pending."""
+        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=True, wg_wait=0)
+        pipeline_v.consumer_release(kv_consumer_state)
+        self._fold_o_native_fp8(acc_O, acc_O_pv, scale_pending)
+        kv_consumer_state.advance()
+        return kv_consumer_state
+
+    @cute.jit
     def first_half_block_overlap(
         self,
         n_block: Int32,
@@ -3019,8 +3296,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         if const_expr(self.native_fp8):
             # The packed f16 conversion below is not valid for E4M3.
-            tOrP_cur.store(tOrP_acc.load().to(self.dtype))
-            _permute_Aregs_fp8(tOrP_cur)
+            _cvt_permute_Aregs_fp8(tOrP_acc, tOrP_cur)
         else:
             # tOrP.store(tOrP_acc.load().to(self.dtype))
             # the "to(self.dtype)" conversion fails to vectorize for block sizes other

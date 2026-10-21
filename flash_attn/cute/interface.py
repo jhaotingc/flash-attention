@@ -191,11 +191,15 @@ def _tile_size_fwd_sm90_native_fp8(
     page_size,
     max_seqlen_q,
     qhead_per_kvhead,
+    num_ctas_tile_m64=None,
+    num_SMs=None,
 ):
     """Return (tile_m, tile_n) for the SM90 native FP8 forward.
 
-    Native Hopper FP8 WGMMA requires RS PV and a K extent divisible by 32. The tiles
-    follow FA3's Hopper FP8 tiles where this kernel's shared memory allows.
+    Native Hopper FP8 WGMMA requires RS PV and a K extent divisible by 32. Decode follows
+    FA3's Hopper FP8 tiles where this kernel's shared memory allows. Prefill uses 64 x 128
+    tiles at d64 and 128 x 128 at d96 (faster than FA3's 192-row tiles here), and at d192
+    64-row tiles while they still fit in one wave (num_ctas_tile_m64 <= num_SMs).
     """
     short_decode = max_seqlen_q * qhead_per_kvhead <= 64
     if short_decode and head_dim == head_dim_v == 96:
@@ -207,12 +211,17 @@ def _tile_size_fwd_sm90_native_fp8(
     if short_decode:
         return (64, 64)
     if head_dim == 64:
-        return 192, 128
+        return 64, 128
     if head_dim <= 96:
-        return 192 if qhead_per_kvhead == 1 else 128, 64 if page_size is not None else 96
+        return 128, 128
     if head_dim <= 128:
         return 128, 192
     if head_dim <= 192:
+        one_wave = (
+            num_ctas_tile_m64 is not None and num_SMs is not None and num_ctas_tile_m64 <= num_SMs
+        )
+        if one_wave:
+            return 64, 128
         return 128, 128 if head_dim_v <= 128 else 96
     # FA3's 128x128 d256 tile exceeds this kernel's shared-memory budget because the
     # native FP8 V tile is staged twice (row-major load + K-major PV operand).
@@ -1200,6 +1209,10 @@ def _flash_attn_fwd(
         # Native FP8 WGMMA requires RS PV; pick FA3's Hopper FP8 tiles unless overridden.
         mma_pv_is_rs = True
         if tile_mn is None:
+            # d192 prefill uses 64-row tiles while those fit in one wave.
+            rows_per_head = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
+                qhead_per_kvhead if pack_gqa else 1
+            )
             tile_mn = _tile_size_fwd_sm90_native_fp8(
                 head_dim,
                 head_dim_v,
@@ -1207,6 +1220,10 @@ def _flash_attn_fwd(
                 page_size,
                 max_seqlen_q,
                 qhead_per_kvhead,
+                num_ctas_tile_m64=batch_size
+                * (num_head_kv if pack_gqa else num_head)
+                * ((rows_per_head + 63) // 64),
+                num_SMs=get_num_sms_for_selection(device.index, arch),
             )
         # Match FA3's paged non-TMA launch policy: K/V without TMA use the PackGQA Q/O copies.
         if page_table is not None and page_size != tile_mn[1]:
@@ -1751,6 +1768,22 @@ def _flash_attn_fwd(
         and (max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= tile_m)
     )
     native_fp8_direct_3d_grid = native_fp8_one_m_block_per_batch and batch_size <= 65535
+    # Prefill / mixed varlen: a direct (head, split, m_block x batch) grid, sized by the
+    # longest request, unless padding it to that request would more than double the grid.
+    native_fp8_direct_m_blocks = False
+    if (
+        native_fp8
+        and not native_fp8_one_m_block_per_batch
+        and cu_seqlens_q is not None
+        and seqused_q is None
+        and not use_block_sparsity
+        and isinstance(max_seqlen_q, int)
+    ):
+        rows_mult = qhead_per_kvhead if pack_gqa else 1
+        grid_m_blocks = batch_size * ((max_seqlen_q * rows_mult + tile_m - 1) // tile_m)
+        native_fp8_direct_m_blocks = grid_m_blocks <= 65535 and grid_m_blocks <= 2 * (
+            (total_q * rows_mult + tile_m - 1) // tile_m
+        )
     native_fp8_ctas_per_sm = 1
     if native_fp8:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
@@ -1774,6 +1807,7 @@ def _flash_attn_fwd(
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
             native_fp8_ctas_per_sm,
+            native_fp8_direct_m_blocks,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1935,6 +1969,7 @@ def _flash_attn_fwd(
                 native_fp8_tma_box_n=native_fp8_tma_box_n,
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
+                native_fp8_direct_m_blocks=native_fp8_direct_m_blocks,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -2159,6 +2194,9 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks_tensor,
                 ])
             compile_args.append(current_stream)
+            # SM90 native FP8 direct m-block grid: max_seqlen_q follows the stream argument.
+            if native_fp8_direct_m_blocks:
+                compile_args.append(max_seqlen_q)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
     if compile_only:
@@ -2283,6 +2321,8 @@ def _flash_attn_fwd(
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
                 ])
+            if native_fp8_direct_m_blocks:  # see compile_args
+                call_args.append(max_seqlen_q)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         if use_sparse_decode:
