@@ -3016,7 +3016,7 @@ def test_flash_attn_fp8_qkv_long_kv_sm90(num_splits, seqlen_k, seqlen_q, d):
 # (head dim, value head dim, q heads, kv heads, requests, query tokens per request, KV length,
 # window, descales) of decode with the default split heuristic. The first group reaches one and
 # two CTAs per SM, the direct decode grid and split-KV with the warp-per-row combine; the later
-# groups add swap-AB tile shapes and cluster sizes.
+# groups add swap-AB tile shapes, cluster sizes and a page table too short to stage.
 _SM90_FP8_DECODE_LAUNCH_CASES = [
     pytest.param(128, 128, 32, 8, 1, 1, 2048, 0, False, id="d128-b1-q1-k2k"),
     pytest.param(128, 128, 32, 8, 64, 1, 2048, 0, False, id="d128-b64-q1-k2k"),
@@ -3044,6 +3044,8 @@ _SM90_FP8_DECODE_LAUNCH_CASES = [
     # 16 and 22 splits.
     pytest.param(128, 128, 64, 8, 1, 9, 4096, 0, False, id="d128-h64-8-b1-q9-k4k"),
     pytest.param(128, 128, 48, 6, 1, 9, 4096, 0, False, id="d128-h48-6-b1-q9-k4k"),
+    # A page-table row of 257 pages (not a multiple of 16 bytes) is not staged.
+    pytest.param(128, 128, 32, 8, 2, 1, 4100, 0, False, id="d128-b2-q1-k4100"),
 ]
 
 

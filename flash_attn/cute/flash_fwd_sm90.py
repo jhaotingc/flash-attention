@@ -393,6 +393,151 @@ def _cluster_groups_per_cta_sm90(num_splits, rows, hdim_v):
     return m * ((rows * (hdim_v // 4) + m * num_splits - 1) // (m * num_splits))
 
 
+@dsl_user_op
+def _cp_async_bulk_g2s(
+    smem_addr: Int32,
+    gmem_addr: cutlass.Int64,
+    num_bytes: Int32,
+    mbar_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Bulk-copy num_bytes from global to shared memory, completing them on an mbarrier."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(num_bytes).ir_value(loc=loc, ip=ip),
+            Int32(mbar_addr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _ld_shared_s32(smem_addr: Int32, *, loc=None, ip=None) -> Int32:
+    """Load an int32 from a raw shared-memory address."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.s32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _prefetch_global_l2(gmem_addr: cutlass.Int64, *, loc=None, ip=None) -> None:
+    """Prefetch one global-memory line into L2."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(gmem_addr).ir_value(loc=loc, ip=ip)],
+        "prefetch.global.L2 [$0];",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _preload_seqlen_info_native_fp8(
+    batch_idx,
+    seqlen_q_static,
+    seqlen_k_static,
+    mCuSeqlensQ=None,
+    mCuSeqlensK=None,
+    mSeqUsedQ=None,
+    mSeqUsedK=None,
+    mCuTotalMBlocks=None,
+    mCuBlockIdxOffsets=None,
+    tile_m=128,
+    tile_n=128,
+):
+    """SeqlenInfoQK.create split in two: issue the global loads now, build the result later.
+
+    Returns a closure that builds the SeqlenInfoQK. Called at kernel entry for the CTA's first
+    tile, it lets the loads' latency overlap the barrier and pipeline setup.
+    """
+    cu_q = (
+        (mCuSeqlensQ[batch_idx], mCuSeqlensQ[batch_idx + 1])
+        if const_expr(mCuSeqlensQ is not None)
+        else None
+    )
+    cu_k = (
+        (mCuSeqlensK[batch_idx], mCuSeqlensK[batch_idx + 1])
+        if const_expr(mCuSeqlensK is not None)
+        else None
+    )
+    used_q = mSeqUsedQ[batch_idx] if const_expr(mSeqUsedQ is not None) else None
+    used_k = mSeqUsedK[batch_idx] if const_expr(mSeqUsedK is not None) else None
+    m_block_offset = mCuTotalMBlocks[batch_idx] if const_expr(mCuTotalMBlocks is not None) else 0
+    block_idx_offset = (
+        mCuBlockIdxOffsets[batch_idx] if const_expr(mCuBlockIdxOffsets is not None) else None
+    )
+
+    def finish():
+        offset_q = 0 if const_expr(cu_q is None) else cu_q[0]
+        offset_k = 0 if const_expr(cu_k is None) else cu_k[0]
+        padded_offset_q = (
+            0
+            if const_expr(cu_q is None)
+            else cute.assume((offset_q + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
+        )
+        padded_offset_k = (
+            0
+            if const_expr(cu_k is None)
+            else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
+        )
+        seqlen_q = (
+            used_q
+            if const_expr(used_q is not None)
+            else seqlen_q_static
+            if const_expr(cu_q is None)
+            else cu_q[1] - offset_q
+        )
+        seqlen_k = (
+            used_k
+            if const_expr(used_k is not None)
+            else seqlen_k_static
+            if const_expr(cu_k is None)
+            else cu_k[1] - offset_k
+        )
+        num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
+        blk_off = (
+            block_idx_offset
+            if const_expr(block_idx_offset is not None)
+            else m_block_offset * num_n_blocks
+        )
+        return SeqlenInfoQK(
+            offset_q,
+            offset_k,
+            padded_offset_q,
+            padded_offset_k,
+            seqlen_q,
+            seqlen_k,
+            m_block_offset,
+            blk_off,
+            num_n_blocks,
+            has_cu_seqlens_q=cu_q is not None,
+            has_cu_seqlens_k=cu_k is not None,
+            has_seqused_q=used_q is not None,
+            has_seqused_k=used_k is not None,
+            has_cu_block_idx_offsets=block_idx_offset is not None,
+        )
+
+    return finish
+
+
 class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
     """Varlen scheduler for launches where every batch has exactly one M block (decode).
 
@@ -548,6 +693,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8_swap_ab_rows: Optional[int] = None,
         native_fp8_cluster_splits: Optional[int] = None,
         native_fp8_swap_ab_full_rows: bool = False,
+        native_fp8_one_wave: bool = False,
+        native_fp8_pt_stage_bytes: int = 0,
+        native_fp8_box_is_page: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -579,6 +727,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.cmb_v4 = (
             self.cluster_combine and self.tile_hdimv == 256 and native_fp8_swap_ab_full_rows
         )
+        # The whole grid fits in one wave: warm the request's page-table row in L2.
+        self.one_wave = native_fp8 and native_fp8_one_wave
+        # Bytes of the request's page-table row staged in shared memory (0: read from global).
+        self.pt_stage_bytes = (
+            native_fp8_pt_stage_bytes if self.swap_ab or self.direct_m_blocks else 0
+        )
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )
@@ -603,6 +757,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             and self.tile_n // self.tma_box_n <= cute.arch.WARP_SIZE
         )
         self.kv_boxes_per_tile = 1 if self.tma_box_n is None else self.tile_n // self.tma_box_n
+        # The TMA box is one whole page: box b of KV tile n is page column n * boxes + b.
+        self.box_is_page = native_fp8_box_is_page and self.tma_box_n is not None
         self.is_split_kv = is_split_kv
         # FP8-KV scale-fold path (SM90: fp16 Q + (fp8-e4m3 -> fp16) paged K/V -> fp16 O).
         self.fp8_kv_dequant = fp8_kv_dequant
@@ -883,14 +1039,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             return SharedStorageQKVDequant
         if const_expr(self.swap_ab):
             # Swap-AB: V stays row-major in sVLoad (the MMA warpgroup transposes it in
-            # registers), P^T is written to sP and sRed holds the cross-warp row reductions
-            # (64 rows x 4 warps x 2 buffers).
+            # registers), P^T is written to sP, sRed holds the cross-warp row reductions
+            # (64 rows x 4 warps x 2 buffers) and sPT the staged page-table row.
             sVLoad_struct = cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(self.sV_load_layout)],
                 self.buffer_align_bytes,
             ]
             mbar_ptr_Vt_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
             sRed_struct = cute.struct.Align[cute.struct.MemRange[Float32, 64 * 4 * 2], 128]
+            sPT_struct = cute.struct.Align[
+                cute.struct.MemRange[Int32, max(self.pt_stage_bytes // 4, 4)], 128
+            ]
             if const_expr(self.cluster_combine):
                 # Cluster combine: sCmbO receives every split's partial O for the 16-byte groups
                 # this CTA owns, sCmbLSE every split's (scaled row max, row sum) per row; both
@@ -914,6 +1073,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     sK: sK_struct
                     sP: sP_struct
                     sRed: sRed_struct
+                    sPT: sPT_struct
+                    mbar_ptr_PT: cute.struct.MemRange[cutlass.Int64, 1]
                     sCmbO: sCmbO_struct
                     sCmbLSE: sCmbLSE_struct
 
@@ -929,6 +1090,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sK: sK_struct
                 sP: sP_struct
                 sRed: sRed_struct
+                sPT: sPT_struct
+                mbar_ptr_PT: cute.struct.MemRange[cutlass.Int64, 1]
 
             return SharedStorageQKVNativeFp8SwapAB
 
@@ -951,6 +1114,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sQ: sQ_struct
                 sK: sK_struct
                 sP: sP_struct
+
+            if const_expr(self.pt_stage_bytes > 0):
+                # Direct-grid prefill: the staged page-table row follows the base storage.
+                @cute.struct
+                class SharedStorageQKVNativeFp8PT:
+                    base: SharedStorageQKVNativeFp8
+                    sPT: cute.struct.Align[
+                        cute.struct.MemRange[Int32, self.pt_stage_bytes // 4], 128
+                    ]
+                    mbar_ptr_PT: cute.struct.MemRange[cutlass.Int64, 1]
+
+                return SharedStorageQKVNativeFp8PT
 
             return SharedStorageQKVNativeFp8
 
@@ -1454,21 +1629,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
-        # Direct grids (decode: (head, split, batch); prefill: (head, split, m_block x batch)):
-        # read the first tile's seqlens before the barrier setup so their global-memory latency
-        # overlaps it.
-        self._seqlen_first = None
-        if const_expr(
-            self.native_fp8
-            and (
-                TileScheduler is SingleMBlockVarlenScheduler
-                or TileScheduler is MultiMBlockVarlenScheduler
-            )
-        ):
-            _, _, first_batch, _ = (
-                TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
-            )
-            self._seqlen_first = SeqlenInfoCls(first_batch)
         # Prefetch tma descriptor
         if warp_idx == 0:
             for tma_atom in (tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_O):
@@ -1477,6 +1637,76 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+        # Direct grids (decode: (head, split, batch); prefill: (head, split, m_block x batch)) know
+        # the CTA's only tile at entry. Copy its request's page-table row into shared memory with
+        # one bulk copy (or, for a one-wave decode grid, warm it in L2), and issue the tile's
+        # seqlen (and swap-AB descale) loads now; they are consumed after the barrier setup below,
+        # which hides their latency.
+        direct_grid = const_expr(
+            TileScheduler is SingleMBlockVarlenScheduler
+            or TileScheduler is MultiMBlockVarlenScheduler
+        )
+        if const_expr(self.native_fp8 and self.pt_stage_bytes > 0 and not self.swap_ab):
+            pt_storage = storage
+            storage = pt_storage.base
+        elif const_expr(self.native_fp8 and self.swap_ab):
+            pt_storage = storage
+        self._pt_stage = const_expr(
+            self.pt_stage_bytes > 0
+            and self.dedicated_kv_load_warp
+            and mPageTable is not None
+            and direct_grid
+        )
+        if const_expr(self._pt_stage):
+            self._pt_base = Int32(pt_storage.sPT.data_ptr().toint())
+            self._pt_mbar = Int32(pt_storage.mbar_ptr_PT.data_ptr().toint())
+            pt_batch_idx = TileScheduler.create(tile_sched_params)._batch_idx
+            if warp_idx == 0:
+                if cute.arch.lane_idx() == 0:
+                    pt_bytes = mPageTable.shape[1] * 4
+                    _mbarrier_init_shared(self._pt_mbar, Int32(1))
+                    _fence_mbarrier_init_cluster()
+                    _mbarrier_arrive_expect_tx_shared(self._pt_mbar, pt_bytes)
+                    _cp_async_bulk_g2s(
+                        self._pt_base,
+                        mPageTable[pt_batch_idx, None].iterator.toint(),
+                        pt_bytes,
+                        self._pt_mbar,
+                    )
+        elif const_expr(
+            self.native_fp8
+            and self.one_wave
+            and mPageTable is not None
+            and TileScheduler is SingleMBlockVarlenScheduler
+        ):
+            if warp_idx == 0:
+                _, _, pf_batch_idx = cute.arch.block_idx()
+                self._prefetch_page_table_row_l2(mPageTable, pf_batch_idx)
+        elif const_expr(
+            self.native_fp8
+            and mPageTable is not None
+            and TileScheduler is MultiMBlockVarlenScheduler
+        ):
+            pf_batch_idx = TileScheduler.create(tile_sched_params)._batch_idx
+            if warp_idx == 0:
+                self._prefetch_page_table_row_l2(mPageTable, pf_batch_idx)
+        self._seqlen_first = None
+        self._descales_first = None
+        if const_expr(self.native_fp8 and direct_grid):
+            _, first_head, first_batch, _ = (
+                TileScheduler.create(tile_sched_params).initial_work_tile_info().tile_idx
+            )
+            self._seqlen_first = _preload_seqlen_info_native_fp8(
+                first_batch, **SeqlenInfoCls.keywords
+            )
+            if const_expr(self.swap_ab and descale_tensors is not None):
+                self._descales_first = self._preload_native_fp8_descales(
+                    descale_tensors,
+                    first_batch,
+                    first_head // self.qhead_per_kvhead
+                    if const_expr(not self.pack_gqa)
+                    else first_head,
+                )
         if const_expr(self.cluster_combine):
             # Every CTA initializes its combine mbarrier before the cluster's first barrier.arrive;
             # the matching barrier.cluster.wait sits right before the first remote store.
@@ -2280,7 +2510,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             seqlen = (
                 SeqlenInfoCls(batch_idx)
                 if const_expr(self._seqlen_first is None)
-                else self._seqlen_first
+                else self._seqlen_first()
             )
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             head_idx_kv = (
@@ -2417,6 +2647,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 seqlen_k=seqlen.seqlen_k,
                 page_size=mK.shape[0] if const_expr(mPageTable is not None) else None,
             )
+            # Warp 0 reads the staged page-table row: wait for its bulk copy (a no-op once done).
+            if const_expr(self._pt_stage):
+                if warp_idx_in_wg == 0:
+                    _mbarrier_wait_parity_shared(self._pt_mbar, Int32(0))
             if split_active:
                 if const_expr(self.dedicated_kv_load_warp):
                     load_Q_cpasync = None
@@ -2474,6 +2708,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+        # A prefill CTA whose M block is past its request's length runs no tile; still wait for
+        # the page-table copy so it does not land in shared memory after the CTA exits.
+        if const_expr(self._pt_stage and self.direct_m_blocks):
+            if warp_idx_in_wg == 0:
+                _mbarrier_wait_parity_shared(self._pt_mbar, Int32(0))
 
     @cute.jit
     def _load_kv_transpose_native_fp8(
@@ -2577,13 +2816,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         the stages allow, warps 1-3 transpose each block's V in order."""
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         if warp_idx_in_wg == 0:
+            # Page-box loads look up their own pages; only whole-tile loads need page_idx.
+            lookup = const_expr(mPageTable is not None and self.tma_box_n is None)
             # Swap-AB's first GEMM reads K first and Q second, so issue Q after the first K.
             q_after_k = const_expr(self.use_tma_Q and self.swap_ab)
             if const_expr(self.use_tma_Q and (not q_after_k)):
                 self._issue_q_tma_native_fp8(pipeline_q, q_producer_phase, load_Q)
             page_idx = None
-            if const_expr(mPageTable is not None):
-                page_idx = mPageTable[batch_idx, n_block]
+            if const_expr(lookup):
+                page_idx = self._page_lookup(mPageTable, batch_idx, n_block)
             if const_expr(load_Q_cpasync is not None):
                 load_Q_cpasync()
             issue_kv(
@@ -2594,14 +2835,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(q_after_k)
                 else None,
             )
-            if const_expr(mPageTable is not None):
-                page_idx = mPageTable[batch_idx, cutlass.max(n_block - 1, 0)]
+            if const_expr(lookup):
+                page_idx = self._page_lookup(mPageTable, batch_idx, cutlass.max(n_block - 1, 0))
             for i in cutlass.range(num_blocks - 1, unroll=1):
                 kv_producer_state.advance()
                 n_block -= 1
                 issue_kv(n_block, kv_producer_state, page_idx)
-                if const_expr(mPageTable is not None):
-                    page_idx = mPageTable[batch_idx, cutlass.max(n_block - 1, 0)]
+                if const_expr(lookup):
+                    page_idx = self._page_lookup(mPageTable, batch_idx, cutlass.max(n_block - 1, 0))
             kv_producer_state.advance()
         else:
             if const_expr(load_Q_cpasync is not None):
@@ -2655,27 +2896,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         after_k: Optional[Callable] = None,
     ):
         """Issue one K/V block. With tma_box_n, the tile is split into page-aligned TMA boxes;
-        lane b looks up the page of box b and the boxes are issued from lane-shuffled indices.
+        lane b looks up the page of box b and the boxes are issued from lane-shuffled indices
+        (with box_is_page, box b is page column n_block * boxes + b, so no row offset).
         after_k, if given, is issued between the K and V loads.
         """
         if const_expr(self.tma_box_n is not None):
             nbox = const_expr(self.kv_boxes_per_tile)
             lane = cute.arch.lane_idx()
-            key0 = n_block * self.tile_n + lane * self.tma_box_n
-            box_valid = lane < nbox and key0 >= 0 and key0 < seqlen_k
             my_page = Int32(-1)
             my_row_box = Int32(0)
-            if box_valid:
-                my_page = mPageTable[batch_idx, key0 // page_size]
-                my_row_box = key0 % page_size // self.tma_box_n
+            if const_expr(self.box_is_page):
+                col = n_block * nbox + lane
+                if lane < nbox and col >= 0 and (col * self.tma_box_n < seqlen_k):
+                    my_page = self._page_lookup(mPageTable, batch_idx, col)
+            else:
+                key0 = n_block * self.tile_n + lane * self.tma_box_n
+                if lane < nbox and key0 >= 0 and (key0 < seqlen_k):
+                    my_page = self._page_lookup(mPageTable, batch_idx, key0 // page_size)
+                    my_row_box = key0 % page_size // self.tma_box_n
+            box_pages = [cute.arch.shuffle_sync(my_page, box) for box in range(nbox)]
+            box_rows = [
+                Int32(0)
+                if const_expr(self.box_is_page)
+                else cute.arch.shuffle_sync(my_row_box, box)
+                for box in range(nbox)
+            ]
             pipeline_k.producer_acquire(producer_state)
             for box in cutlass.range_constexpr(nbox):
                 load_K(
-                    src_idx=(
-                        cute.arch.shuffle_sync(my_row_box, box),
-                        0,
-                        cute.arch.shuffle_sync(my_page, box),
-                    ),
+                    src_idx=(box_rows[box], 0, box_pages[box]),
                     dst_idx=box + nbox * producer_state.index,
                     tma_bar_ptr=pipeline_k.producer_get_barrier(producer_state),
                 )
@@ -2684,11 +2933,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             pipeline_vt.producer_acquire(producer_state)
             for box in cutlass.range_constexpr(nbox):
                 load_V(
-                    src_idx=(
-                        cute.arch.shuffle_sync(my_row_box, box),
-                        0,
-                        cute.arch.shuffle_sync(my_page, box),
-                    ),
+                    src_idx=(box_rows[box], 0, box_pages[box]),
                     dst_idx=box + nbox * producer_state.index,
                     tma_bar_ptr=pipeline_vt.producer_get_barrier(producer_state),
                 )
@@ -3000,7 +3245,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             seqlen = (
                 SeqlenInfoCls(batch_idx)
                 if const_expr(self._seqlen_first is None)
-                else self._seqlen_first
+                else self._seqlen_first()
             )
 
             softmax_tile = softmax
@@ -3430,7 +3675,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             seqlen = (
                 SeqlenInfoCls(batch_idx)
                 if const_expr(self._seqlen_first is None)
-                else self._seqlen_first
+                else self._seqlen_first()
             )
             scale_log2 = softmax_scale_log2
             v_descale_tile = Float32(1.0)
@@ -3438,9 +3683,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
                 )
-                qk_descale, v_descale_tile = self._load_native_fp8_descales(
-                    descale_tensors, batch_idx, head_idx_kv
-                )
+                if const_expr(self._descales_first is not None):
+                    qk_descale, v_descale_tile = self._descales_first()
+                else:
+                    qk_descale, v_descale_tile = self._load_native_fp8_descales(
+                        descale_tensors, batch_idx, head_idx_kv
+                    )
                 scale_log2 = softmax_scale_log2 * qk_descale
             split_active = True
             if const_expr(self.is_split_kv):
@@ -4048,6 +4296,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 mLSE_cur[lse_q] = lse[r, j]
 
     @cute.jit
+    def _page_lookup(self, mPageTable: cute.Tensor, batch_idx: Int32, col: Int32) -> Int32:
+        """Page of column col of the request's page-table row: from the staged shared-memory copy
+        when the page table is staged, else from global memory.
+        """
+        page = Int32(0)
+        if const_expr(self._pt_stage):
+            page = _ld_shared_s32(self._pt_base + col * 4)
+        else:
+            page = mPageTable[batch_idx, col]
+        return page
+
+    @cute.jit
+    def _prefetch_page_table_row_l2(self, mPageTable: cute.Tensor, batch_idx: Int32):
+        """Prefetch a request's page-table row into L2, one 128-byte line per lane."""
+        row_addr = mPageTable[batch_idx, None].iterator.toint()
+        num_lines = cute.ceil_div(mPageTable.shape[1] * 4, 128)
+        lane = cute.arch.lane_idx()
+        for i in cutlass.range(cute.ceil_div(num_lines, cute.arch.WARP_SIZE), unroll=1):
+            line = lane + cute.arch.WARP_SIZE * i
+            if line < num_lines:
+                _prefetch_global_l2(row_addr + cutlass.Int64(line) * 128)
+
+    @cute.jit
     def _cluster_combine_swap_ab_native_fp8(
         self,
         acc_O: cute.Tensor,
@@ -4612,34 +4883,31 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def _load_native_fp8_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
         """Load native FP8 QK score and V output descales from scalar or (B, Hkv) storage."""
-        qk_descale = Float32(1.0)
-        v_descale = Float32(1.0)
+        return self._preload_native_fp8_descales(descale_tensors, batch_idx, kv_head_idx)()
+
+    def _preload_native_fp8_descales(self, descale_tensors, batch_idx: Int32, kv_head_idx: Int32):
+        """Issue the descale loads for (batch_idx, kv_head_idx) now; return a closure that
+        combines them into (qk_descale, v_descale) later (see _load_native_fp8_descales).
+        """
+        raw = [None, None, None]
         if const_expr(descale_tensors is not None):
-            if const_expr(descale_tensors.q_descale is not None):
-                q_descale = descale_tensors.q_descale
-                q_scale = (
-                    q_descale[()]
-                    if const_expr(len(q_descale.shape) == 0)
-                    else q_descale[batch_idx, kv_head_idx]
-                )
-                qk_descale = qk_descale * Float32(q_scale)
-            if const_expr(descale_tensors.k_descale is not None):
-                k_descale = descale_tensors.k_descale
-                k_scale = (
-                    k_descale[()]
-                    if const_expr(len(k_descale.shape) == 0)
-                    else k_descale[batch_idx, kv_head_idx]
-                )
-                qk_descale = qk_descale * Float32(k_scale)
-            if const_expr(descale_tensors.v_descale is not None):
-                v_descale_tensor = descale_tensors.v_descale
-                v_scale = (
-                    v_descale_tensor[()]
-                    if const_expr(len(v_descale_tensor.shape) == 0)
-                    else v_descale_tensor[batch_idx, kv_head_idx]
-                )
-                v_descale = Float32(v_scale)
-        return qk_descale, v_descale
+            for i, t in enumerate(
+                (descale_tensors.q_descale, descale_tensors.k_descale, descale_tensors.v_descale)
+            ):
+                if const_expr(t is not None):
+                    raw[i] = t[()] if const_expr(len(t.shape) == 0) else t[batch_idx, kv_head_idx]
+
+        def finish():
+            qk_descale = Float32(1.0)
+            v_descale = Float32(1.0)
+            for i in range(2):
+                if const_expr(raw[i] is not None):
+                    qk_descale = qk_descale * Float32(raw[i])
+            if const_expr(raw[2] is not None):
+                v_descale = Float32(raw[2])
+            return qk_descale, v_descale
+
+        return finish
 
     @cute.jit
     def _narrow_q_to_compute(self, q_narrow_params):

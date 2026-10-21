@@ -492,6 +492,57 @@ def _num_splits_sm90_native_fp8(
     return num_splits
 
 
+def _pt_stage_bytes_sm90_native_fp8(
+    page_table,
+    swap_ab_rows,
+    direct_grid,
+    tile_m,
+    tile_n,
+    head_dim,
+    head_dim_v,
+    ctas_per_sm,
+    num_stages,
+    swap_ab_q_rows,
+    cluster_splits,
+):
+    """Shared memory for staging a request's page-table row in a direct-grid launch, or 0.
+
+    The row is bulk-copied, so it must be contiguous, 16-byte aligned and a multiple of 4
+    pages long; the copy must also fit next to the pipeline (and cluster exchange buffers).
+    direct_grid also implies TMA K/V: the TMA warp is the one reading the staged row.
+    """
+    if page_table is None or not direct_grid:
+        return 0
+    width = page_table.shape[1]
+    try:
+        aligned = (
+            page_table.stride(1) == 1
+            and page_table.stride(0) * 4 % 16 == 0
+            and page_table.data_ptr() % 16 == 0
+        )
+    except Exception:
+        return 0
+    if not aligned or width % 4 != 0:
+        return 0
+    row_bytes = (width * 4 + 127) // 128 * 128
+    if swap_ab_rows is None:
+        used = _smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_stages) + 256
+    else:
+        used = (
+            _smem_bytes_sm90_native_fp8_swap_ab(
+                tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, num_stages, swap_ab_q_rows
+            )
+            + 256
+        )
+    if cluster_splits is not None:
+        used += _cluster_exchange_bytes_sm90_native_fp8(cluster_splits, swap_ab_rows, head_dim_v)
+    if ctas_per_sm == 2:
+        budget = _SM90_SMEM_PER_SM_BYTES // 2 - _SM90_SMEM_RESERVED_PER_CTA_BYTES - 1024
+    else:
+        budget = _SM90_MAX_SMEM_PER_CTA_BYTES - _SM90_SMEM_RESERVED_PER_CTA_BYTES
+    return row_bytes if used + row_bytes <= budget else 0
+
+
 def _seqlen_k_loaded_sm90_native_fp8(
     max_seqlen_k, local, window_size_left, window_size_right, tile_m
 ):
@@ -2096,6 +2147,8 @@ def _flash_attn_fwd(
             (total_q * rows_mult + tile_m - 1) // tile_m
         )
     native_fp8_ctas_per_sm = 1
+    native_fp8_one_wave = False
+    native_fp8_pt_stage_bytes = 0
     if native_fp8:
         seqlen_q_rows = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
             qhead_per_kvhead if pack_gqa else 1
@@ -2127,6 +2180,23 @@ def _flash_attn_fwd(
             native_fp8_swap_ab_q_rows,
             cluster=native_fp8_cluster_splits is not None,
         )
+        native_fp8_one_wave = num_ctas <= native_fp8_ctas_per_sm * get_num_sms_for_selection(
+            device.index, arch
+        )
+        native_fp8_pt_stage_bytes = _pt_stage_bytes_sm90_native_fp8(
+            page_table,
+            native_fp8_swap_ab_rows,
+            (native_fp8_direct_3d_grid or native_fp8_direct_m_blocks)
+            and not (page_size not in [None, tile_n] and native_fp8_tma_box_n is None),
+            tile_m,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            native_fp8_ctas_per_sm,
+            native_fp8_num_stages,
+            native_fp8_swap_ab_q_rows,
+            native_fp8_cluster_splits,
+        )
         compile_key += (
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
@@ -2137,6 +2207,9 @@ def _flash_attn_fwd(
             native_fp8_cluster_splits,
             # a swap-AB tile whose rows are all live (the cluster combine's two-row pushes)
             native_fp8_swap_ab_rows == max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1),
+            native_fp8_one_wave,
+            native_fp8_pt_stage_bytes,
+            native_fp8_tma_box_n is not None and page_size == native_fp8_tma_box_n,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -2315,6 +2388,11 @@ def _flash_attn_fwd(
                 native_fp8_cluster_splits=native_fp8_cluster_splits,
                 native_fp8_swap_ab_full_rows=(
                     native_fp8_swap_ab_rows == max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+                ),
+                native_fp8_one_wave=native_fp8_one_wave,
+                native_fp8_pt_stage_bytes=native_fp8_pt_stage_bytes,
+                native_fp8_box_is_page=(
+                    native_fp8_tma_box_n is not None and page_size == native_fp8_tma_box_n
                 ),
             )
         elif arch // 10 in [10, 11]:
