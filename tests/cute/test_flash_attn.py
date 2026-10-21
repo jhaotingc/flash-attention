@@ -3013,41 +3013,44 @@ def test_flash_attn_fp8_qkv_long_kv_sm90(num_splits, seqlen_k, seqlen_q, d):
     assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
 
 
-# (head dim, q heads, kv heads, requests, query tokens per request, KV length, window). With the
-# default split heuristic these reach one and two CTAs per SM, split-KV with the combine kernel and
-# the direct decode grid.
+# (head dim, value head dim, q heads, kv heads, requests, query tokens per request, KV length,
+# window, descales) of decode with the default split heuristic: one and two CTAs per SM, the
+# direct decode grid and split-KV with the warp-per-row combine.
 _SM90_FP8_DECODE_LAUNCH_CASES = [
-    pytest.param(128, 32, 8, 1, 1, 2048, 0, id="d128-b1-q1-k2k"),
-    pytest.param(128, 32, 8, 64, 1, 2048, 0, id="d128-b64-q1-k2k"),
-    pytest.param(128, 32, 8, 1, 1, 32768, 0, id="d128-b1-q1-k32k"),
-    pytest.param(128, 32, 8, 16, 4, 16384, 0, id="d128-b16-q4-k16k"),
-    pytest.param(128, 32, 8, 16, 1, 4096, 0, id="d128-b16-q1-k4k"),
-    pytest.param(128, 32, 8, 16, 16, 4096, 0, id="d128-b16-q16-k4k"),
-    pytest.param(128, 16, 2, 1, 1, 4096, 0, id="d128-h16-2-b1-q1-k4k"),
-    pytest.param(64, 8, 8, 8, 1, 8192, 0, id="d64-b8-q1-k8k"),
-    pytest.param(256, 8, 4, 4, 4, 28216, 1024, id="d256-b4-q4-k28k-w1024"),
-    pytest.param(256, 16, 4, 1, 16, 4096, 0, id="d256-h16-4-b1-q16-k4k"),
+    pytest.param(128, 128, 32, 8, 1, 1, 2048, 0, False, id="d128-b1-q1-k2k"),
+    pytest.param(128, 128, 32, 8, 64, 1, 2048, 0, False, id="d128-b64-q1-k2k"),
+    pytest.param(128, 128, 32, 8, 1, 1, 32768, 0, False, id="d128-b1-q1-k32k"),
+    pytest.param(128, 128, 32, 8, 16, 4, 16384, 0, False, id="d128-b16-q4-k16k"),
+    pytest.param(128, 128, 32, 8, 16, 1, 4096, 0, False, id="d128-b16-q1-k4k"),
+    pytest.param(128, 128, 32, 8, 16, 16, 4096, 0, False, id="d128-b16-q16-k4k"),
+    pytest.param(128, 128, 16, 2, 1, 1, 4096, 0, False, id="d128-h16-2-b1-q1-k4k"),
+    pytest.param(64, 64, 8, 8, 8, 1, 8192, 0, False, id="d64-b8-q1-k8k"),
+    pytest.param(256, 256, 8, 4, 4, 4, 28216, 1024, False, id="d256-b4-q4-k28k-w1024"),
+    pytest.param(256, 256, 16, 4, 1, 16, 4096, 0, False, id="d256-h16-4-b1-q16-k4k"),
+    pytest.param(128, 128, 32, 8, 1, 16, 32768, 0, True, id="d128-b1-q16-k32k-descales"),
+    pytest.param(128, 128, 64, 8, 2, 16, 4096, 0, False, id="d128-h64-8-b2-q16-k4k"),
 ]
 
 
 @pytest.mark.skipif(not IS_SM90, reason="FP8 Q/K/V forward is SM90-only")
 @pytest.mark.parametrize(
-    "d, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window",
+    "d, dv, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window, descales",
     _SM90_FP8_DECODE_LAUNCH_CASES,
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_fp8_qkv_decode_launch_sm90(
-    d, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window
+    d, dv, nheads, nheads_k, batch_size, seqlen_q, seqlen_k, window, descales
 ):
     """SM90 FP8 Q/K/V decode with vLLM-style arguments (varlen Q, 16-token pages, per-request
-    KV lengths, default split heuristic) across the launch shapes the split heuristic picks."""
+    KV lengths, default split heuristic) across the launch shapes the split heuristic picks.
+    Checks O and the LSE against an fp32 reference."""
     device, fp8, page_size = "cuda", torch.float8_e4m3fn, 16
     torch.random.manual_seed(0)
     q = (torch.randn(batch_size * seqlen_q, nheads, d, device=device) * 0.5).to(fp8)
     num_pages = (seqlen_k + page_size - 1) // page_size
     num_blocks = batch_size * num_pages
     k_paged = (torch.randn(num_blocks, page_size, nheads_k, d, device=device) * 0.5).to(fp8)
-    v_paged = (torch.randn(num_blocks, page_size, nheads_k, d, device=device) * 0.5 + 0.5).to(fp8)
+    v_paged = (torch.randn(num_blocks, page_size, nheads_k, dv, device=device) * 0.5 + 0.5).to(fp8)
     page_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device), "(b n) -> b n", b=batch_size
     )
@@ -3058,8 +3061,15 @@ def test_flash_attn_fp8_qkv_decode_launch_sm90(
         [seqlen_k - 37 * i for i in range(batch_size)], dtype=torch.int32, device=device
     )
     window_size = (window - 1, 0) if window else (None, None)
+    q_descale = k_descale = v_descale = None
+    if descales:
+        b = torch.arange(batch_size, device=device, dtype=torch.float32)[:, None]
+        h = torch.arange(nheads_k, device=device, dtype=torch.float32)[None, :]
+        q_descale, k_descale, v_descale = (
+            (base + 0.05 * b + 0.03 * h) for base in (0.5, 0.75, 0.6)
+        )
 
-    out, *_ = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q,
         k_paged,
         v_paged,
@@ -3072,17 +3082,21 @@ def test_flash_attn_fp8_qkv_decode_launch_sm90(
         window_size_left=window_size[0],
         window_size_right=window_size[1],
         num_splits=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        return_lse=True,
     )
     if is_fake_mode():
         return
 
     gather = lambda paged: rearrange(
         paged[page_table.flatten()], "(b n) p ... -> b (n p) ...", b=batch_size
-    )[:, :seqlen_k].to(torch.bfloat16)
-    q_ref = rearrange(q, "(b s) h d -> b s h d", b=batch_size).to(torch.bfloat16)
+    )[:, :seqlen_k].float()
+    q_ref = rearrange(q, "(b s) h d -> b s h d", b=batch_size).float()
     arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
     key_padding_mask = arange < rearrange(cache_seqlens, "b -> b 1")
-    out_ref, _ = attention_ref(
+    out_ref, _, lse_ref = attention_ref(
         q_ref,
         gather(k_paged),
         gather(v_paged),
@@ -3090,12 +3104,20 @@ def test_flash_attn_fp8_qkv_decode_launch_sm90(
         key_padding_mask,
         causal=True,
         window_size=window_size,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        return_lse=True,
     )
     out = rearrange(out, "(b s) h d -> b s h d", b=batch_size)
     print_diff_stats("Output", out, out_ref)
     err, ref = (out - out_ref).float(), out_ref.float()
     assert err.abs().mean().item() <= 0.01 * ref.abs().mean().item()
     assert abs(err.mean().item()) <= 0.005 * abs(ref.mean().item())
+    # Requests with no KV left (seqlen_k - 37 * i <= 0) have LSE -inf.
+    lse, live = rearrange(lse, "h (b s) -> b h s", b=batch_size), torch.isfinite(lse_ref)
+    assert (lse[~live] == -math.inf).all()
+    assert (lse - lse_ref)[live].abs().max().item() <= 1e-2
 
 
 # (head dim, value head dim, q heads, kv heads, (query tokens, KV length) per request, window,

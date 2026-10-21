@@ -38,6 +38,7 @@ class FlashAttentionForwardCombine:
         num_threads: int = 256,
         stages: int = 4,
         output_quant_key: Optional[cutlass.Constexpr[str]] = None,
+        use_pdl: bool = False,
     ):
         """
         Forward combine kernel for split attention computation.
@@ -66,6 +67,9 @@ class FlashAttentionForwardCombine:
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
         self.output_quant_key = output_quant_key
+        # Launched as a programmatic dependent (PDL) of the attention kernel; the kernel
+        # already waits for its predecessor (griddepcontrol.wait) before reading partials.
+        self.use_pdl = use_pdl
 
     @staticmethod
     def can_implement(
@@ -359,6 +363,7 @@ class FlashAttentionForwardCombine:
             block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel

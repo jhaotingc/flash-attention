@@ -51,6 +51,7 @@ from flash_attn.cute.flash_bwd_postprocess import (
     LearnableSinkBwdTensors,
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
+from flash_attn.cute.flash_fwd_combine_warp_row import FlashAttentionForwardCombineWarpRow
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
@@ -2337,6 +2338,24 @@ def _flash_attn_fwd(
                 output_scale=output_scale,
                 _arch=arch,
             )
+        # SM90 native FP8 varlen: one warp per output row, launched as a programmatic
+        # dependent of the attention kernel (its prologue overlaps the attention tail).
+        elif (
+            native_fp8
+            and arch // 10 == 9
+            and cu_seqlens_q is not None
+            and seqused_q is None
+            and not has_scheduler_metadata
+            and output_scale is None
+            and num_splits <= _SM90_NATIVE_FP8_WARP_ROW_COMBINE_MAX_SPLITS
+        ):
+            _flash_attn_fwd_combine_warp_row(
+                out_partial,
+                lse_partial.transpose(-1, -2),
+                out,
+                lse.transpose(-1, -2) if lse is not None else None,
+                use_pdl=True,
+            )
         else:
             _flash_attn_fwd_combine(
                 out_partial,
@@ -2349,6 +2368,7 @@ def _flash_attn_fwd(
                 virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
                 output_scale=output_scale,
                 _arch=arch,
+                use_pdl=native_fp8,
             )
     if reuse_scheduler_metadata and tile_count_semaphore is not None:
         # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
@@ -4418,7 +4438,7 @@ def compile_flash_attn_varlen_func_from_specs(
 def _compile_fwd_combine(
     _arch, dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, lse_leading_dim, has_virtual_batch_idx,
-    has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key,
+    has_num_splits_dynamic, has_semaphore_to_reset, output_quant_key, use_pdl=False,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -4433,6 +4453,7 @@ def _compile_fwd_combine(
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
         output_quant_key=output_quant_key,
+        use_pdl=use_pdl,
     )
     if not fa_combine.can_implement(
         dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
@@ -4485,6 +4506,62 @@ def _compile_fwd_combine(
     )
 
 
+# SM90 native FP8 split-KV combine with one warp per output row (flash_fwd_combine_warp_row).
+_SM90_NATIVE_FP8_WARP_ROW_COMBINE_MAX_SPLITS = 32
+
+
+def _flash_attn_fwd_combine_warp_row(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    lse: Optional[torch.Tensor] = None,
+    *,
+    use_pdl: bool = False,
+) -> None:
+    """Combine varlen split-KV partials (at most 32 splits) with one warp per output row.
+
+    out_partial (num_splits, total_q, num_head, head_dim) fp32; lse_partial (num_splits, total_q,
+    num_head) with total_q contiguous; out (total_q, num_head, head_dim); lse (total_q, num_head)
+    or None. Compiled for 8, 16 or 32 splits. use_pdl launches it as a programmatic dependent of
+    the preceding kernel on the stream.
+    """
+    num_splits = out_partial.shape[0]
+    assert num_splits <= _SM90_NATIVE_FP8_WARP_ROW_COMBINE_MAX_SPLITS
+    max_splits = 8 if num_splits <= 8 else 16 if num_splits <= 16 else 32
+    head_dim = out_partial.shape[-1]
+    lse_leading_dim = None if lse is None else 0 if lse.stride(0) == 1 else 1
+    dtype = torch2cute_dtype_map[out.dtype]
+    compile_key = (dtype, head_dim, max_splits, lse_leading_dim, use_pdl)
+    cache = _flash_attn_fwd_combine_warp_row.compile_cache
+    if compile_key not in cache:
+        sym = cute.sym_int
+        num_splits_s, total_q, nheads = (sym(), sym(), sym())
+        mO_partial = fake_tensor(Float32, (num_splits_s, total_q, nheads, head_dim), divisibility=4)
+        mLSE_partial = fake_tensor(
+            Float32, (num_splits_s, total_q, nheads), divisibility=1, leading_dim=1
+        )
+        mO = fake_tensor(dtype, (total_q, nheads, head_dim), divisibility=128 // dtype.width)
+        mLSE = (
+            fake_tensor(Float32, (total_q, nheads), divisibility=1, leading_dim=lse_leading_dim)
+            if lse is not None
+            else None
+        )
+        cache[compile_key] = cute.compile(
+            FlashAttentionForwardCombineWarpRow(dtype, head_dim, max_splits, use_pdl=use_pdl),
+            mO_partial,
+            mLSE_partial,
+            mO,
+            mLSE,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not is_fake_mode():
+        cache[compile_key](out_partial, lse_partial, out, lse)
+
+
+_flash_attn_fwd_combine_warp_row.compile_cache = get_jit_cache("fwd_combine_warp_row")
+
+
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -4498,6 +4575,7 @@ def _flash_attn_fwd_combine(
     output_scale: Optional[torch.Tensor] = None,
     *,
     _arch: Optional[int] = None,
+    use_pdl: bool = False,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -4591,6 +4669,8 @@ def _flash_attn_fwd_combine(
         semaphore_to_reset is not None,
         output_quant_key,
     )
+    if use_pdl:  # keeps the compile keys of existing callers unchanged
+        compile_key += (use_pdl,)
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
             *compile_key
