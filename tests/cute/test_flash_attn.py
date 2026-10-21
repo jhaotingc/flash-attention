@@ -3015,8 +3015,8 @@ def test_flash_attn_fp8_qkv_long_kv_sm90(num_splits, seqlen_k, seqlen_q, d):
 
 # (head dim, value head dim, q heads, kv heads, requests, query tokens per request, KV length,
 # window, descales) of decode with the default split heuristic. The first group reaches one and
-# two CTAs per SM, the direct decode grid and split-KV with the warp-per-row combine; the second
-# group adds swap-AB tile shapes.
+# two CTAs per SM, the direct decode grid and split-KV with the warp-per-row combine; the later
+# groups add swap-AB tile shapes and cluster sizes.
 _SM90_FP8_DECODE_LAUNCH_CASES = [
     pytest.param(128, 128, 32, 8, 1, 1, 2048, 0, False, id="d128-b1-q1-k2k"),
     pytest.param(128, 128, 32, 8, 64, 1, 2048, 0, False, id="d128-b64-q1-k2k"),
@@ -3036,6 +3036,14 @@ _SM90_FP8_DECODE_LAUNCH_CASES = [
     pytest.param(128, 128, 12, 2, 4, 1, 4096, 0, True, id="d128-h12-2-b4-q1-k4k-descales"),
     pytest.param(96, 96, 16, 4, 8, 1, 4096, 0, False, id="d96-b8-q1-k4k"),
     pytest.param(192, 128, 16, 1, 32, 1, 4096, 128, False, id="d192-dv128-h16-1-b32-q1-k4k-w128"),
+    # Cluster combine: hdim 256 with padded rows, and more cluster sizes.
+    pytest.param(256, 256, 8, 4, 4, 3, 28216, 1024, False, id="d256-b4-q3-k28k-w1024"),
+    pytest.param(128, 128, 16, 2, 2, 4, 16384, 0, False, id="d128-h16-2-b2-q4-k16k"),
+    pytest.param(128, 128, 32, 8, 2, 1, 8192, 0, False, id="d128-b2-q1-k8k"),
+    # More than 64 rows per KV head (no swap-AB): split-KV with the warp-per-row combine at
+    # 16 and 22 splits.
+    pytest.param(128, 128, 64, 8, 1, 9, 4096, 0, False, id="d128-h64-8-b1-q9-k4k"),
+    pytest.param(128, 128, 48, 6, 1, 9, 4096, 0, False, id="d128-h48-6-b1-q9-k4k"),
 ]
 
 

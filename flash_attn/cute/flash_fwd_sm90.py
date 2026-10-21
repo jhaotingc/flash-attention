@@ -202,6 +202,197 @@ def _mov_b32(a: Int32, *, loc=None, ip=None) -> Int32:
 _SAB_PIPELINE_MAX_ROWS = 16
 
 
+@dsl_user_op
+def _mapa_shared_cluster(smem_addr: Int32, cta_rank: Int32, *, loc=None, ip=None) -> Int32:
+    """Address of the same shared-memory location in CTA cta_rank of the cluster."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip), Int32(cta_rank).ir_value(loc=loc, ip=ip)],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _st_async_cluster_v2_f32(
+    dsmem_addr: Int32, a: Float32, b: Float32, dsmem_mbar: Int32, *, loc=None, ip=None
+) -> None:
+    """Store two f32 into another CTA's shared memory and complete 8 transaction bytes on
+    its mbarrier (both addresses from _mapa_shared_cluster).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(dsmem_addr).ir_value(loc=loc, ip=ip),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            Int32(dsmem_mbar).ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v2.f32 [$0], {$1, $2}, [$3];",
+        "r,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _st_async_cluster_v4_f32(
+    dsmem_addr: Int32,
+    a: Float32,
+    b: Float32,
+    c: Float32,
+    d: Float32,
+    dsmem_mbar: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Store four f32 into another CTA's shared memory and complete 16 transaction bytes
+    on its mbarrier.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(dsmem_addr).ir_value(loc=loc, ip=ip),
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            Float32(c).ir_value(loc=loc, ip=ip),
+            Float32(d).ir_value(loc=loc, ip=ip),
+            Int32(dsmem_mbar).ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32"
+        " [$0], {$1, $2, $3, $4}, [$5];",
+        "r,f,f,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v2_f32(smem_addr: Int32, *, loc=None, ip=None):
+    """Load two f32 from a raw shared-memory address."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 2),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v2.f32 {$0, $1}, [$2];",
+        "=f,=f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple((Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(2)))
+
+
+@dsl_user_op
+def _ld_shared_v4_f32(smem_addr: Int32, *, loc=None, ip=None):
+    """Load four f32 from a raw shared-memory address."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];",
+        "=f,=f,=f,=f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return tuple((Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)))
+
+
+@dsl_user_op
+def _st_global_v2_b32(gmem_addr: cutlass.Int64, a: Int32, b: Int32, *, loc=None, ip=None) -> None:
+    """Store two 32-bit words to global memory."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+            Int32(a).ir_value(loc=loc, ip=ip),
+            Int32(b).ir_value(loc=loc, ip=ip),
+        ],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_init_shared(mbar_addr: Int32, count: Int32, *, loc=None, ip=None) -> None:
+    """Initialize an mbarrier at a raw shared-memory address."""
+    llvm.inline_asm(
+        None,
+        [Int32(mbar_addr).ir_value(loc=loc, ip=ip), Int32(count).ir_value(loc=loc, ip=ip)],
+        "mbarrier.init.shared::cta.b64 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _fence_mbarrier_init_cluster(*, loc=None, ip=None) -> None:
+    """Make preceding mbarrier inits visible to the cluster (and to the async proxy)."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.mbarrier_init.release.cluster;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_arrive_expect_tx_shared(
+    mbar_addr: Int32, tx_bytes: Int32, *, loc=None, ip=None
+) -> None:
+    """Arrive on an mbarrier and add tx_bytes to the transaction bytes its phase waits for."""
+    llvm.inline_asm(
+        None,
+        [Int32(mbar_addr).ir_value(loc=loc, ip=ip), Int32(tx_bytes).ir_value(loc=loc, ip=ip)],
+        "mbarrier.arrive.expect_tx.shared::cta.b64 _, [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_wait_parity_shared(mbar_addr: Int32, parity: Int32, *, loc=None, ip=None) -> None:
+    """Spin until the mbarrier phase with the given parity completes."""
+    llvm.inline_asm(
+        None,
+        [Int32(mbar_addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def _cluster_groups_per_cta_sm90(num_splits, rows, hdim_v):
+    """16-byte O groups (4 fp32 channels of one row) each CTA of a cluster combine owns.
+
+    The rows x hdim_v / 4 groups are split evenly over the num_splits CTAs of the cluster; at
+    hdim_v 256 each CTA owns an even number, since its pushes carry two rows per 16 bytes.
+    """
+    m = 2 if hdim_v == 256 else 1
+    return m * ((rows * (hdim_v // 4) + m * num_splits - 1) // (m * num_splits))
+
+
 class SingleMBlockVarlenScheduler(SingleTileVarlenScheduler):
     """Varlen scheduler for launches where every batch has exactly one M block (decode).
 
@@ -355,6 +546,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         native_fp8_ctas_per_sm: int = 1,
         native_fp8_direct_m_blocks: bool = False,
         native_fp8_swap_ab_rows: Optional[int] = None,
+        native_fp8_cluster_splits: Optional[int] = None,
+        native_fp8_swap_ab_full_rows: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -379,6 +572,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             else self.tile_m
         )
         self._sab_barrier_id = int(NamedBarrierFwd.SwapABReduce)
+        # Swap-AB split-KV whose splits form one thread block cluster and combine through DSMEM.
+        self.cluster_splits = native_fp8_cluster_splits if native_fp8 else None
+        self.cluster_combine = self.cluster_splits is not None
+        # hdim_v 256 with every row live: the cluster combine pushes 16-byte units of two rows.
+        self.cmb_v4 = (
+            self.cluster_combine and self.tile_hdimv == 256 and native_fp8_swap_ab_full_rows
+        )
         assert (native_fp8_o_dtype is not None) == self.native_fp8, (
             "native_fp8_o_dtype must be supplied exactly when native_fp8 is enabled"
         )
@@ -437,6 +637,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             and (not self.Q_in_regs)
         ), "native FP8 swap-AB decode needs tile_m 64, rows in [8, 64] and tile_n % 64 == 0"
         self.cluster_shape_mn = (1, 1)
+        assert not self.cluster_combine or (
+            self.swap_ab
+            and self.is_split_kv
+            and self.direct_3d_grid
+            and (2 <= self.cluster_splits <= 8)
+        ), "native FP8 cluster split-KV combine needs swap-AB decode on the direct grid"
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
 
     def _get_smem_layout_atom(self):
@@ -685,6 +891,34 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ]
             mbar_ptr_Vt_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
             sRed_struct = cute.struct.Align[cute.struct.MemRange[Float32, 64 * 4 * 2], 128]
+            if const_expr(self.cluster_combine):
+                # Cluster combine: sCmbO receives every split's partial O for the 16-byte groups
+                # this CTA owns, sCmbLSE every split's (scaled row max, row sum) per row; both
+                # are written by remote st.async that complete on mbar_ptr_Cmb.
+                cmb_groups = self._cmb_groups_per_cta()
+                sCmbO_struct = cute.struct.Align[
+                    cute.struct.MemRange[Float32, self.cluster_splits * cmb_groups * 4], 128
+                ]
+                sCmbLSE_struct = cute.struct.Align[
+                    cute.struct.MemRange[Float32, self.cluster_splits * self.sab_n * 2], 128
+                ]
+
+                @cute.struct
+                class SharedStorageQKVNativeFp8SwapABCluster:
+                    mbar_ptr_Q: mbar_ptr_Q_struct
+                    mbar_ptr_Cmb: cute.struct.MemRange[cutlass.Int64, 1]
+                    mbar_ptr_K: mbar_ptr_K_struct
+                    mbar_ptr_Vt: mbar_ptr_Vt_struct
+                    sVLoad: sVLoad_struct
+                    sQ: sQ_struct
+                    sK: sK_struct
+                    sP: sP_struct
+                    sRed: sRed_struct
+                    sCmbO: sCmbO_struct
+                    sCmbLSE: sCmbLSE_struct
+
+                return SharedStorageQKVNativeFp8SwapABCluster
+
             @cute.struct
             class SharedStorageQKVNativeFp8SwapAB:
                 mbar_ptr_Q: mbar_ptr_Q_struct
@@ -784,9 +1018,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             assert all(t.element_type == Float8E4M3FN for t in (mQ, mK, mV)), (
                 "native_fp8 requires E4M3 Q, K, and V"
             )
-            assert mO.element_type == (Float32 if self.is_split_kv else self.o_dtype), (
-                "native_fp8 writes the configured output dtype, or FP32 SplitKV partials"
-            )
+            assert mO.element_type == (
+                Float32 if self.is_split_kv and (not self.cluster_combine) else self.o_dtype
+            ), "native_fp8 writes the configured output dtype, or FP32 SplitKV partials"
             assert mLSE is None or mLSE.element_type == Float32
             assert all(
                 t is None or t.element_type == Int32
@@ -830,9 +1064,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = layout_utils.select(mQ, Q_layout_transpose)
         num_splits = Int32(1)
-        if const_expr(not self.is_split_kv):
+        if const_expr(not self.is_split_kv or self.cluster_combine):
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+            # The cluster combine writes the final O and LSE: no split-KV partials.
+            if const_expr(self.cluster_combine):
+                num_splits = Int32(self.cluster_splits)
         else:
             O_layout_transpose = (
                 [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
@@ -1089,7 +1326,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
         )
 
-        self.kernel(
+        kernel_launcher = self.kernel(
             tma_tensor_Q if const_expr(self.use_tma_Q) else mQ,
             tma_tensor_K if const_expr(self.use_tma_KV) else mK,
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
@@ -1132,12 +1369,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             fastdiv_mods,
             output_scale,
             descale_tensors,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            stream=stream,
-            min_blocks_per_mp=self.ctas_per_sm,
         )
+        # The cluster combine launches each (head, batch)'s splits as one cluster along grid y.
+        if const_expr(self.cluster_combine):
+            kernel_launcher.launch(
+                grid=grid_dim,
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=self.ctas_per_sm,
+                cluster=[1, self.cluster_splits, 1],
+            )
+        else:
+            kernel_launcher.launch(
+                grid=grid_dim,
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+                min_blocks_per_mp=self.ctas_per_sm,
+            )
 
     @cute.kernel
     def kernel(
@@ -1229,6 +1477,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+        if const_expr(self.cluster_combine):
+            # Every CTA initializes its combine mbarrier before the cluster's first barrier.arrive;
+            # the matching barrier.cluster.wait sits right before the first remote store.
+            if warp_idx == 0:
+                if cute.arch.lane_idx() == 0:
+                    _mbarrier_init_shared(Int32(storage.mbar_ptr_Cmb.data_ptr().toint()), Int32(1))
+                    _fence_mbarrier_init_cluster()
+            cute.arch.cluster_arrive_relaxed()
 
         # Mbarrier / pipeline init
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
@@ -1474,6 +1730,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
             if const_expr(self.swap_ab):
+                # Shared-memory addresses of the cluster combine's exchange buffers and mbarrier.
+                cmb_bases = None
+                if const_expr(self.cluster_combine):
+                    cmb_bases = (
+                        Int32(storage.sCmbO.data_ptr().toint()),
+                        Int32(storage.sCmbLSE.data_ptr().toint()),
+                        Int32(storage.mbar_ptr_Cmb.data_ptr().toint()),
+                    )
                 self.mma_swap_ab_native_fp8(
                     tiled_mma_qk,
                     tiled_mma_pv,
@@ -1494,6 +1758,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     TileSchedulerCls,
                     num_splits,
                     descale_tensors,
+                    cmb_bases,
                 )
             else:
                 self.mma(
@@ -3085,6 +3350,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         TileSchedulerCls: Callable,
         num_splits: Int32 = Int32(1),
         descale_tensors=None,
+        cmb_bases=None,
     ):
         """Consumer warpgroup of swap-AB decode: the live query rows are the WGMMA N dimension.
 
@@ -3399,31 +3665,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.barrier(
                     barrier_id=self._sab_barrier_id, number_of_threads=self.num_mma_threads
                 )
-                # 1 / row sum (with the V descale) and the LSE.
-                lse = cute.make_rmem_tensor((2, num_n8), Float32)
-                LN2 = math.log(2.0)
-                for j in cutlass.range_constexpr(num_n8):
-                    for r in cutlass.range_constexpr(2):
-                        n = 8 * j + 2 * lane_c + r
-                        s = (
-                            sRed[n, 0, red_parity]
-                            + sRed[n, 1, red_parity]
-                            + (sRed[n, 2, red_parity] + sRed[n, 3, red_parity])
-                        )
-                        zero_or_nan = s == 0.0 or s != s
-                        row_scale[r, j] = (
-                            cute.arch.rcp_approx(s if not zero_or_nan else 1.0) * v_descale_tile
-                        )
-                        lse[r, j] = (
-                            (
-                                row_max[r, j] * scale_log2
-                                - max_offset
-                                + cute.math.log2(s, fastmath=True)
+                # The cluster combine normalizes after merging the splits (it needs the raw row
+                # max and sum); otherwise compute 1 / sum (with the V descale) and the LSE here.
+                if const_expr(self.cluster_combine):
+                    for j in cutlass.range_constexpr(num_n8):
+                        for r in cutlass.range_constexpr(2):
+                            n = 8 * j + 2 * lane_c + r
+                            row_sum[r, j] = (
+                                sRed[n, 0, red_parity]
+                                + sRed[n, 1, red_parity]
+                                + (sRed[n, 2, red_parity] + sRed[n, 3, red_parity])
                             )
-                            * LN2
-                            if not zero_or_nan
-                            else -Float32.inf
-                        )
+                else:
+                    lse = cute.make_rmem_tensor((2, num_n8), Float32)
+                    LN2 = math.log(2.0)
+                    for j in cutlass.range_constexpr(num_n8):
+                        for r in cutlass.range_constexpr(2):
+                            n = 8 * j + 2 * lane_c + r
+                            s = (
+                                sRed[n, 0, red_parity]
+                                + sRed[n, 1, red_parity]
+                                + (sRed[n, 2, red_parity] + sRed[n, 3, red_parity])
+                            )
+                            zero_or_nan = s == 0.0 or s != s
+                            row_scale[r, j] = (
+                                cute.arch.rcp_approx(s if not zero_or_nan else 1.0) * v_descale_tile
+                            )
+                            lse[r, j] = (
+                                (
+                                    row_max[r, j] * scale_log2
+                                    - max_offset
+                                    + cute.math.log2(s, fastmath=True)
+                                )
+                                * LN2
+                                if not zero_or_nan
+                                else -Float32.inf
+                            )
                 red_parity ^= 1
                 if const_expr(self.sab_n <= _SAB_PIPELINE_MAX_ROWS):
                     warpgroup.wait_group(0)
@@ -3432,15 +3709,62 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.is_split_kv):
                     if n_block_min >= n_block_max:
                         acc_O.fill(0.0)
-                        lse.fill(-Float32.inf)
-                # Let the combine kernel (a programmatic dependent launch) start its prologue;
-                # it still waits for this grid's partials with griddepcontrol.wait.
-                if const_expr(self.is_split_kv):
-                    cute.arch.griddepcontrol_launch_dependents()
-                self._epilogue_swap_ab_native_fp8(
+                        if const_expr(self.cluster_combine):
+                            row_max.fill(-Float32.inf)
+                            row_sum.fill(0.0)
+                        else:
+                            lse.fill(-Float32.inf)
+                if const_expr(self.cluster_combine):
+                    self._cluster_combine_swap_ab_native_fp8(
+                        acc_O,
+                        row_max,
+                        row_sum,
+                        v_descale_tile,
+                        scale_log2,
+                        mO,
+                        mLSE,
+                        seqlen,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        split_idx,
+                        warp,
+                        lane_g,
+                        lane_c,
+                        tidx,
+                        cmb_bases,
+                    )
+                else:
+                    # Let the combine kernel (a programmatic dependent launch) start its prologue;
+                    # it still waits for this grid's partials with griddepcontrol.wait.
+                    if const_expr(self.is_split_kv):
+                        cute.arch.griddepcontrol_launch_dependents()
+                    self._epilogue_swap_ab_native_fp8(
+                        acc_O,
+                        row_scale,
+                        lse,
+                        mO,
+                        mLSE,
+                        seqlen,
+                        m_block,
+                        head_idx,
+                        batch_idx,
+                        split_idx,
+                        warp,
+                        lane_g,
+                        lane_c,
+                    )
+            elif const_expr(self.cluster_combine):
+                # Inactive split (no KV in range): still takes part in the cluster exchange.
+                acc_O.fill(0.0)
+                row_max.fill(-Float32.inf)
+                row_sum.fill(0.0)
+                self._cluster_combine_swap_ab_native_fp8(
                     acc_O,
-                    row_scale,
-                    lse,
+                    row_max,
+                    row_sum,
+                    v_descale_tile,
+                    scale_log2,
                     mO,
                     mLSE,
                     seqlen,
@@ -3451,6 +3775,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     warp,
                     lane_g,
                     lane_c,
+                    tidx,
+                    cmb_bases,
                 )
             else:
                 # Inactive split: write O = 0 and LSE = -inf for the combine kernel.
@@ -3722,6 +4048,261 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 mLSE_cur[lse_q] = lse[r, j]
 
     @cute.jit
+    def _cluster_combine_swap_ab_native_fp8(
+        self,
+        acc_O: cute.Tensor,
+        row_max: cute.Tensor,
+        row_sum: cute.Tensor,
+        v_descale: Float32,
+        scale_log2: Float32,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        warp: Int32,
+        lane_g: Int32,
+        lane_c: Int32,
+        tidx: Int32,
+        cmb_bases,
+    ):
+        """Split-KV combine inside the cluster of a (head, batch)'s splits, through DSMEM.
+
+        The rows x hdim_v outputs are divided into 16-byte groups (4 channels of one row), each
+        owned by one CTA of the cluster. Every CTA pushes, with st.async into the owners' shared
+        memory, its unnormalized partial O of every group and its (scaled row max, row sum) of
+        every row; each st.async completes its bytes on the owner's mbarrier. Each owner then
+        merges the splits of its groups (weights exp2(max_s - max), normalization, V descale)
+        and writes the final O and LSE. No partials go through global memory and no combine
+        kernel runs.
+
+        Only live rows are pushed, so thread 0 arms the mbarrier with the bytes it will actually
+        receive. Remote stores may complete before that arm: the transaction count may go
+        negative, and the phase completes once the arrive and all bytes are in. The cluster
+        barrier (arrived in the prologue, after the mbarrier init) is waited on before the first
+        remote store, so no CTA writes into an uninitialized mbarrier. With cmb_v4 (hdim_v 256,
+        all rows live) one 16-byte unit carries two rows x two channels, halving the stores.
+        """
+        n_rows = const_expr(self.sab_n)
+        num_n8 = const_expr(n_rows // 8)
+        num_dt = const_expr((self.tile_hdimv + 63) // 64)
+        hdv = const_expr(self.tile_hdimv)
+        num_cta = const_expr(self.cluster_splits)
+        groups_per_row = const_expr(hdv // 4)
+        num_groups = const_expr(n_rows * groups_per_row)
+        groups_per_cta = const_expr(self._cmb_groups_per_cta())
+        qhead_per_row = const_expr(self.qhead_per_kvhead if self.pack_gqa else 1)
+        o_base, stats_base, mbar_base = cmb_bases
+        num_q_rows = seqlen.seqlen_q * qhead_per_row
+        # Arm the mbarrier with the bytes this CTA will receive from all num_cta splits: its
+        # owned groups of the live rows plus 8 bytes of statistics per live row.
+        if tidx == 0:
+            owned_bytes = Int32(0)
+            if const_expr(self.cmb_v4):
+                lo = split_idx * groups_per_cta
+                full_end = num_q_rows // 2 * (hdv // 2)
+                owned_bytes = (
+                    cutlass.max(cutlass.min(lo + groups_per_cta, full_end) - lo, 0) * 16
+                    + cutlass.max(
+                        cutlass.min(lo + groups_per_cta, (num_q_rows + 1) // 2 * (hdv // 2))
+                        - cutlass.max(lo, full_end),
+                        0,
+                    )
+                    * 8
+                )
+            else:
+                owned_bytes = (
+                    cutlass.min(
+                        groups_per_cta,
+                        cutlass.max(num_q_rows * groups_per_row - split_idx * groups_per_cta, 0),
+                    )
+                    * 16
+                )
+            _mbarrier_arrive_expect_tx_shared(mbar_base, num_cta * (owned_bytes + num_q_rows * 8))
+        cute.arch.cluster_wait()
+        # Push the partial O of every live (row, group) to the CTA that owns it.
+        for j in cutlass.range_constexpr(num_n8):
+            if const_expr(self.cmb_v4):
+                n = 8 * j + 2 * lane_c
+                for dt in cutlass.range_constexpr(num_dt):
+                    u = n // 2 * (hdv // 2) + 32 * dt + 8 * warp + lane_g
+                    owner = u // groups_per_cta
+                    dst = _mapa_shared_cluster(
+                        o_base + (split_idx * groups_per_cta + u - owner * groups_per_cta) * 16,
+                        owner,
+                    )
+                    if n + 1 < num_q_rows:
+                        _st_async_cluster_v4_f32(
+                            dst,
+                            acc_O[self._sab_crd(0, 0, dt, j)],
+                            acc_O[self._sab_crd(0, 1, dt, j)],
+                            acc_O[self._sab_crd(1, 0, dt, j)],
+                            acc_O[self._sab_crd(1, 1, dt, j)],
+                            _mapa_shared_cluster(mbar_base, owner),
+                        )
+                    elif n < num_q_rows:
+                        _st_async_cluster_v2_f32(
+                            dst,
+                            acc_O[self._sab_crd(0, 0, dt, j)],
+                            acc_O[self._sab_crd(0, 1, dt, j)],
+                            _mapa_shared_cluster(mbar_base, owner),
+                        )
+            else:
+                for r in cutlass.range_constexpr(2):
+                    n = 8 * j + 2 * lane_c + r
+                    if n < num_q_rows:
+                        for dt in cutlass.range_constexpr(num_dt):
+                            d = 64 * dt + 16 * warp + 2 * lane_g
+                            if const_expr(64 * (dt + 1) <= hdv):
+                                self._push_o_pair_native_fp8(
+                                    acc_O, o_base, mbar_base, split_idx, r, dt, j, n, d
+                                )
+                            elif d < hdv:
+                                self._push_o_pair_native_fp8(
+                                    acc_O, o_base, mbar_base, split_idx, r, dt, j, n, d
+                                )
+        # Push the (scaled row max, row sum) of every live row to every CTA: lanes with
+        # lane // 4 = c (warp 0) or 8 + c (warp 1) serve owner c.
+        owner = warp * 8 + lane_g
+        if owner < num_cta:
+            for j in cutlass.range_constexpr(num_n8):
+                n = 8 * j + 2 * lane_c
+                z0 = row_max[0, j] * scale_log2 - Float32(8.0)
+                z1 = row_max[1, j] * scale_log2 - Float32(8.0)
+                if n + 1 < num_q_rows:
+                    _st_async_cluster_v4_f32(
+                        _mapa_shared_cluster(stats_base + (split_idx * n_rows + n) * 8, owner),
+                        z0,
+                        row_sum[0, j],
+                        z1,
+                        row_sum[1, j],
+                        _mapa_shared_cluster(mbar_base, owner),
+                    )
+                elif n < num_q_rows:
+                    _st_async_cluster_v2_f32(
+                        _mapa_shared_cluster(stats_base + (split_idx * n_rows + n) * 8, owner),
+                        z0,
+                        row_sum[0, j],
+                        _mapa_shared_cluster(mbar_base, owner),
+                    )
+        _mbarrier_wait_parity_shared(mbar_base, Int32(0))
+        # Merge the splits of each owned group and write the final O (and LSE once per row).
+        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+        mLSE_cur = None
+        if const_expr(mLSE is not None):
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
+        out_dtype = mO.element_type
+        LN2 = math.log(2.0)
+        for it in cutlass.range_constexpr(
+            (groups_per_cta + self.num_mma_threads - 1) // self.num_mma_threads
+        ):
+            slot = tidx + self.num_mma_threads * it
+            item = slot
+            if const_expr(self.cmb_v4):
+                slot = item - item % 2
+            u = split_idx * groups_per_cta + slot
+            n = u // groups_per_row
+            d = (u - n * groups_per_row) * 4
+            if const_expr(self.cmb_v4):
+                n = u // (hdv // 2) * 2 + item % 2
+                d = (u - u // (hdv // 2) * (hdv // 2)) * 2
+            row = m_block * self.tile_m + n
+            if slot < groups_per_cta and u < num_groups and (row < num_q_rows):
+                z_s = cute.make_rmem_tensor((num_cta,), Float32)
+                sum_s = cute.make_rmem_tensor((num_cta,), Float32)
+                for c in cutlass.range_constexpr(num_cta):
+                    z_val, sum_val = _ld_shared_v2_f32(stats_base + (c * n_rows + n) * 8)
+                    z_s[c] = z_val
+                    sum_s[c] = sum_val
+                o_s = cute.make_rmem_tensor((num_cta, 4), Float32)
+                for c in cutlass.range_constexpr(num_cta):
+                    v0, v1, v2, v3 = (Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0))
+                    if const_expr(self.cmb_v4):
+                        v0, v1 = _ld_shared_v2_f32(
+                            o_base + (c * groups_per_cta + slot) * 16 + item % 2 * 8
+                        )
+                        v2, v3 = _ld_shared_v2_f32(
+                            o_base + (c * groups_per_cta + slot) * 16 + 16 + item % 2 * 8
+                        )
+                    else:
+                        v0, v1, v2, v3 = _ld_shared_v4_f32(
+                            o_base + (c * groups_per_cta + slot) * 16
+                        )
+                    o_s[c, 0] = v0
+                    o_s[c, 1] = v1
+                    o_s[c, 2] = v2
+                    o_s[c, 3] = v3
+                z_max = z_s[0]
+                for c in cutlass.range_constexpr(1, num_cta):
+                    z_max = utils.fmax(z_max, z_s[c])
+                z_max_safe = Float32(0.0) if z_max == -Float32.inf else z_max
+                denom = Float32(0.0)
+                acc = cute.make_rmem_tensor((4,), Float32)
+                acc.fill(0.0)
+                for c in cutlass.range_constexpr(num_cta):
+                    w = cute.math.exp2(z_s[c] - z_max_safe, fastmath=True)
+                    denom += w * sum_s[c]
+                    for t in cutlass.range_constexpr(4):
+                        acc[t] += w * o_s[c, t]
+                inv = cute.arch.rcp_approx(denom) * v_descale if denom > 0.0 else Float32(0.0)
+                q_idx = row // qhead_per_row
+                h_idx = row - q_idx * qhead_per_row
+                o_vec = cute.make_rmem_tensor((4,), out_dtype)
+                for t in cutlass.range_constexpr(4):
+                    o_vec[t] = out_dtype(acc[t] * inv)
+                o_vec_i32 = cute.recast_tensor(o_vec, Int32)
+                if const_expr(self.pack_gqa):
+                    o_addr = mO_cur[(h_idx, q_idx), None].iterator.toint()
+                else:
+                    o_addr = mO_cur[q_idx, None].iterator.toint()
+                _st_global_v2_b32(
+                    o_addr + cutlass.Int64(d) * (out_dtype.width // 8), o_vec_i32[0], o_vec_i32[1]
+                )
+                if const_expr(mLSE is not None):
+                    if d == 0:
+                        lse_out = (
+                            (z_max_safe + cute.math.log2(denom, fastmath=True)) * LN2
+                            if denom > 0.0
+                            else -Float32.inf
+                        )
+                        if const_expr(self.pack_gqa):
+                            mLSE_cur[(h_idx, q_idx),] = lse_out
+                        else:
+                            mLSE_cur[q_idx] = lse_out
+
+    def _cmb_groups_per_cta(self) -> int:
+        """16-byte O groups each CTA of the cluster combine owns (_cluster_groups_per_cta_sm90)."""
+        return _cluster_groups_per_cta_sm90(self.cluster_splits, self.sab_n, self.tile_hdimv)
+
+    @cute.jit
+    def _push_o_pair_native_fp8(
+        self,
+        acc_O: cute.Tensor,
+        o_base: Int32,
+        mbar_base: Int32,
+        split_idx: Int32,
+        r: cutlass.Constexpr[int],
+        dt: cutlass.Constexpr[int],
+        j: cutlass.Constexpr[int],
+        n: Int32,
+        d: Int32,
+    ):
+        """Push channels d and d + 1 of row n of this split's partial O to the owning CTA."""
+        groups_per_cta = const_expr(self._cmb_groups_per_cta())
+        u = n * (self.tile_hdimv // 4) + d // 4
+        owner = u // groups_per_cta
+        slot = u - owner * groups_per_cta
+        offset = ((split_idx * groups_per_cta + slot) * 4 + (d - d // 4 * 4)) * 4
+        _st_async_cluster_v2_f32(
+            _mapa_shared_cluster(o_base + offset, owner),
+            acc_O[self._sab_crd(r, 0, dt, j)],
+            acc_O[self._sab_crd(r, 1, dt, j)],
+            _mapa_shared_cluster(mbar_base, owner),
+        )
+
+    @cute.jit
     def _sab_split_range_native_fp8(
         self,
         block_info: BlockInfo,
@@ -3749,9 +4330,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         n_block_min_full, n_block_max_full = block_info_full.get_n_block_min_max(seqlen, m_block)
         num_n_blocks = cutlass.max(n_block_max_full - n_block_min_full, 0)
+        splits = const_expr(self.cluster_splits) if const_expr(self.cluster_combine) else num_splits
         blocks_per_split = Int32(1)
-        if num_n_blocks > num_splits:
-            blocks_per_split = (num_n_blocks + num_splits - 1) // num_splits
+        if num_n_blocks > splits:
+            blocks_per_split = (num_n_blocks + splits - 1) // splits
         n_block_min = n_block_min_full + split_idx * blocks_per_split
         n_block_max = cutlass.min(n_block_min + blocks_per_split, n_block_max_full)
         return (n_block_min, n_block_max, split_idx == 0 or n_block_min < n_block_max_full)

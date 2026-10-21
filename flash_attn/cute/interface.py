@@ -38,7 +38,7 @@ from flash_attn.cute.cute_dsl_utils import (
     validate_output_layout,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
-from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90, _cluster_groups_per_cta_sm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -264,10 +264,19 @@ def _fits_two_ctas_sm90_native_fp8(
 
 
 def _ctas_per_sm_sm90_native_fp8(
-    tile_m, tile_n, head_dim, head_dim_v, num_ctas, num_SMs, swap_ab_rows=None, swap_ab_q_rows=None
+    tile_m,
+    tile_n,
+    head_dim,
+    head_dim_v,
+    num_ctas,
+    num_SMs,
+    swap_ab_rows=None,
+    cluster=False,
+    swap_ab_q_rows=None,
 ):
-    """Two CTAs per SM when they fit and the grid exceeds one wave."""
-    if num_ctas > num_SMs and _fits_two_ctas_sm90_native_fp8(
+    """Two CTAs per SM when they fit and the grid exceeds one wave. A cluster combine always
+    runs two CTAs per SM: its cluster placement (_two_cta_cluster_capacity_sm90) assumes it."""
+    if (num_ctas > num_SMs or cluster) and _fits_two_ctas_sm90_native_fp8(
         tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, swap_ab_q_rows
     ):
         return 2
@@ -275,10 +284,11 @@ def _ctas_per_sm_sm90_native_fp8(
 
 
 # Swap-AB decode (S^T = K Q^T, O^T = V^T P^T): the live query rows of a KV head are the WGMMA N
-# dimension, so decode tiles carry no padded rows. Up to 64 rows, 4 K/V stages and 16 splits.
+# dimension, so decode tiles carry no padded rows. Up to 64 rows, 4 K/V stages and 8 splits,
+# so the splits of a (head, batch) fit one portable thread block cluster.
 _SM90_NATIVE_FP8_SWAP_AB_MAX_ROWS = 64
 _SM90_NATIVE_FP8_MAX_STAGES = 4
-_SM90_NATIVE_FP8_SWAP_AB_MAX_SPLITS = 16
+_SM90_NATIVE_FP8_SWAP_AB_MAX_SPLITS = 8
 # Largest dynamic shared memory of one SM90 CTA.
 _SM90_MAX_SMEM_PER_CTA_BYTES = 227 * 1024
 
@@ -331,16 +341,24 @@ def _smem_bytes_sm90_native_fp8_swap_ab(
 
 
 def _num_stages_sm90_native_fp8(
-    tile_m, tile_n, head_dim, head_dim_v, ctas_per_sm, swap_ab_rows, swap_ab_q_rows=None
+    tile_m,
+    tile_n,
+    head_dim,
+    head_dim_v,
+    ctas_per_sm,
+    swap_ab_rows,
+    swap_ab_q_rows=None,
+    cluster=False,
 ):
-    """K/V pipeline stages: 2, or for swap-AB decode at one CTA per SM the deepest pipeline, up
-    to 4 stages, that fits in shared memory."""
+    """K/V pipeline stages: 2, or for swap-AB decode at one CTA per SM (outside a cluster
+    combine) the deepest pipeline, up to 4 stages, that fits in shared memory."""
     if swap_ab_rows is None or ctas_per_sm == 2:
         return 2
     budget = _SM90_MAX_SMEM_PER_CTA_BYTES - _SM90_SMEM_RESERVED_PER_CTA_BYTES
     num_stages = 2
     while (
-        num_stages < _SM90_NATIVE_FP8_MAX_STAGES
+        not cluster
+        and num_stages < _SM90_NATIVE_FP8_MAX_STAGES
         and _smem_bytes_sm90_native_fp8_swap_ab(
             tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, num_stages + 1, swap_ab_q_rows
         )
@@ -348,6 +366,116 @@ def _num_stages_sm90_native_fp8(
     ):
         num_stages += 1
     return num_stages
+
+
+# Swap-AB split-KV combined inside a thread block cluster of its 2-8 splits (DSMEM). 8 is the
+# portable cluster size; larger clusters need the non-portable cluster-size opt-in.
+_SM90_NATIVE_FP8_MAX_CLUSTER_SPLITS = 8
+# H200: 132 SMs in GPCs of at most 18 SMs; clusters never span GPCs. Each GPC is assumed to
+# hold at least 24 CTA slots for clusters at two CTAs per SM.
+_SM90_MAX_SMS_PER_GPC = 18
+_SM90_MIN_CLUSTER_SLOTS_PER_GPC = 24
+
+
+def _cluster_exchange_bytes_sm90_native_fp8(num_splits, swap_ab_rows, head_dim_v):
+    """Shared memory of the cluster combine's exchange buffers: every split's partial O for
+    the owned 16-byte groups, and every split's (row max, row sum) per row."""
+    groups_per_cta = _cluster_groups_per_cta_sm90(num_splits, swap_ab_rows, head_dim_v)
+    return (num_splits * groups_per_cta * 16 + 127) // 128 * 128 + (
+        num_splits * swap_ab_rows * 8 + 127
+    ) // 128 * 128
+
+
+def _two_cta_cluster_capacity_sm90(cluster_size, num_SMs):
+    """Clusters of cluster_size CTAs that can be resident at once at two CTAs per SM."""
+    num_gpcs = (num_SMs + _SM90_MAX_SMS_PER_GPC - 1) // _SM90_MAX_SMS_PER_GPC
+    return num_gpcs * (_SM90_MIN_CLUSTER_SLOTS_PER_GPC // cluster_size)
+
+
+def _two_cta_cluster_splits_sm90_native_fp8(total_mblocks, num_n_blocks, num_SMs):
+    """Most splits (2-8) whose clusters all fit at once: at least 2 KV tiles per split, one
+    wave at two CTAs per SM and every M block's cluster resident; evened out over the KV
+    tiles. 0 if not even 2 splits fit."""
+    best = 0
+    for splits in range(2, _SM90_NATIVE_FP8_MAX_CLUSTER_SPLITS + 1):
+        if (
+            2 * splits > num_n_blocks
+            or total_mblocks * splits > 2 * num_SMs
+            or total_mblocks > _two_cta_cluster_capacity_sm90(splits, num_SMs)
+        ):
+            break
+        best = splits
+    if best == 0:
+        return 0
+    tiles = (num_n_blocks + best - 1) // best
+    return (num_n_blocks + tiles - 1) // tiles
+
+
+def _cluster_splits_sm90_native_fp8(
+    num_splits,
+    swap_ab_rows,
+    direct_grid,
+    tile_m,
+    tile_n,
+    head_dim,
+    head_dim_v,
+    batch_size,
+    num_heads_grid,
+    num_SMs,
+    swap_ab_q_rows=None,
+):
+    """Cluster size for a swap-AB split-KV launch, or None for a combine through global
+    memory. Needs the direct decode grid and 2-8 splits; above one wave the clusters must
+    all be resident at two CTAs per SM; and the exchange buffers must fit next to the
+    pipeline in half of the SM's shared memory."""
+    if (
+        swap_ab_rows is None
+        or not direct_grid
+        or not 2 <= num_splits <= _SM90_NATIVE_FP8_MAX_CLUSTER_SPLITS
+    ):
+        return None
+    num_ctas = batch_size * num_heads_grid * num_splits
+    if num_ctas > num_SMs and (
+        num_ctas > 2 * num_SMs
+        or (
+            num_splits > 2
+            and batch_size * num_heads_grid > _two_cta_cluster_capacity_sm90(num_splits, num_SMs)
+        )
+    ):
+        return None
+    ctas_per_sm = _ctas_per_sm_sm90_native_fp8(
+        tile_m,
+        tile_n,
+        head_dim,
+        head_dim_v,
+        num_ctas,
+        num_SMs,
+        swap_ab_rows,
+        cluster=True,
+        swap_ab_q_rows=swap_ab_q_rows,
+    )
+    num_stages = _num_stages_sm90_native_fp8(
+        tile_m,
+        tile_n,
+        head_dim,
+        head_dim_v,
+        ctas_per_sm,
+        swap_ab_rows,
+        swap_ab_q_rows,
+        cluster=True,
+    )
+    exchange_bytes = _cluster_exchange_bytes_sm90_native_fp8(num_splits, swap_ab_rows, head_dim_v)
+    budget = _SM90_SMEM_PER_SM_BYTES // 2 - _SM90_SMEM_RESERVED_PER_CTA_BYTES - 1024
+    if (
+        ctas_per_sm != 2
+        or _smem_bytes_sm90_native_fp8_swap_ab(
+            tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, num_stages, swap_ab_q_rows
+        )
+        + exchange_bytes
+        > budget
+    ):
+        return None
+    return num_splits
 
 
 def _num_splits_sm90_native_fp8(
@@ -780,13 +908,28 @@ def _get_fwd_config(
             ),
             auto_splits,
         )
-        # Swap-AB decode: at most 16 splits; when the M blocks leave room for two or more
-        # splits each, keep the grid to one wave of CTAs. With a window, even the window's KV
-        # tiles out over the splits.
+        # Swap-AB decode: at most 8 splits; when the M blocks leave room for two or more
+        # splits each, keep the grid to one wave of CTAs. With a window, take more splits
+        # when their clusters fit (_two_cta_cluster_splits_sm90_native_fp8) and that cuts
+        # each split's KV tiles by at least 40%; then even the window's tiles out over them.
         if native_fp8_swap_ab_rows is not None and auto_splits:
             num_splits = min(num_splits, _SM90_NATIVE_FP8_SWAP_AB_MAX_SPLITS)
             if total_mblocks * num_splits > num_SMs and num_SMs // max(1, total_mblocks) >= 2:
                 num_splits = num_SMs // total_mblocks
+            if local and total_mblocks * num_splits <= num_SMs:
+                two_cta_splits = _two_cta_cluster_splits_sm90_native_fp8(
+                    total_mblocks, num_n_blocks, num_SMs
+                )
+                tiles_one_wave = (num_n_blocks + num_splits - 1) // num_splits
+                if (
+                    two_cta_splits > num_splits
+                    and tiles_one_wave >= 4
+                    and (
+                        5 * ((num_n_blocks + two_cta_splits - 1) // two_cta_splits)
+                        <= 3 * tiles_one_wave
+                    )
+                ):
+                    num_splits = two_cta_splits
             if local and num_splits > 1:
                 tiles_per_split = (num_n_blocks + num_splits - 1) // num_splits
                 num_splits = (num_n_blocks + tiles_per_split - 1) // tiles_per_split
@@ -1456,7 +1599,32 @@ def _flash_attn_fwd(
         num_splits = decode_splits[1]
 
     is_split_kv = num_splits > 1
-    if is_split_kv:
+    # Swap-AB split-KV on the direct decode grid may combine its splits inside a cluster
+    # (no fp32 partials in global memory, no combine kernel).
+    native_fp8_cluster_splits = None
+    if native_fp8 and is_split_kv and not use_sparse_decode:
+        native_fp8_direct_grid = (
+            cu_seqlens_q is not None
+            and seqused_q is None
+            and not use_block_sparsity
+            and isinstance(max_seqlen_q, int)
+            and max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1) <= tile_m
+            and batch_size <= 65535
+        )
+        native_fp8_cluster_splits = _cluster_splits_sm90_native_fp8(
+            num_splits,
+            native_fp8_swap_ab_rows,
+            native_fp8_direct_grid,
+            tile_m,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            batch_size,
+            num_head_kv if pack_gqa else num_head,
+            get_num_sms_for_selection(device.index, arch),
+            native_fp8_swap_ab_q_rows,
+        )
+    if is_split_kv and native_fp8_cluster_splits is None:
         # flash_fwd_combine wants the query dim contiguous in the partial LSE; qv has it first
         lse_partial_shape = (
             (num_splits, lse_shape[1], lse_shape[0]) if use_sparse_decode
@@ -1946,6 +2114,7 @@ def _flash_attn_fwd(
             num_ctas,
             get_num_sms_for_selection(device.index, arch),
             native_fp8_swap_ab_rows,
+            cluster=native_fp8_cluster_splits is not None,
             swap_ab_q_rows=native_fp8_swap_ab_q_rows,
         )
         native_fp8_num_stages = _num_stages_sm90_native_fp8(
@@ -1956,6 +2125,7 @@ def _flash_attn_fwd(
             native_fp8_ctas_per_sm,
             native_fp8_swap_ab_rows,
             native_fp8_swap_ab_q_rows,
+            cluster=native_fp8_cluster_splits is not None,
         )
         compile_key += (
             native_fp8_one_m_block_per_batch,
@@ -1964,6 +2134,9 @@ def _flash_attn_fwd(
             native_fp8_direct_m_blocks,
             native_fp8_swap_ab_rows,
             native_fp8_num_stages,
+            native_fp8_cluster_splits,
+            # a swap-AB tile whose rows are all live (the cluster combine's two-row pushes)
+            native_fp8_swap_ab_rows == max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1),
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1998,9 +2171,15 @@ def _flash_attn_fwd(
             else None
         )
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            to_cute_tensor(t)
+            for t in (
+                q,
+                k,
+                v,
+                out if not is_split_kv or native_fp8_cluster_splits is not None else out_partial,
+            )
         ]
-        if is_split_kv:
+        if is_split_kv and native_fp8_cluster_splits is None:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
@@ -2133,6 +2312,10 @@ def _flash_attn_fwd(
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
                 native_fp8_direct_m_blocks=native_fp8_direct_m_blocks,
                 native_fp8_swap_ab_rows=native_fp8_swap_ab_rows,
+                native_fp8_cluster_splits=native_fp8_cluster_splits,
+                native_fp8_swap_ab_full_rows=(
+                    native_fp8_swap_ab_rows == max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+                ),
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
@@ -2431,8 +2614,10 @@ def _flash_attn_fwd(
                 q_call,
                 k_call,
                 v_call,
-                out_call if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
+                out_call
+                if not is_split_kv or native_fp8_cluster_splits is not None
+                else out_partial,
+                lse_partial if is_split_kv and native_fp8_cluster_splits is None else lse,
                 softmax_scale,
                 cu_seqlens_q,
                 cu_seqlens_k,
@@ -2487,7 +2672,7 @@ def _flash_attn_fwd(
             if native_fp8_direct_m_blocks:  # see compile_args
                 call_args.append(max_seqlen_q)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
-    if is_split_kv:
+    if is_split_kv and native_fp8_cluster_splits is None:
         if use_sparse_decode:
             # decode partials are per token row: one batch of length total_q, no cu_seqlens
             _flash_attn_fwd_combine(
