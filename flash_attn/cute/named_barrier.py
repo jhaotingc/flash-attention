@@ -23,6 +23,9 @@ class NamedBarrierFwd(enum.IntEnum):
     PSync = enum.auto()
     # hdim>256: RAW on sP, after the P store + proxy fence, before the PV GEMM.
     PSyncRAW = enum.auto()
+    # SM90 native FP8 swap-AB decode: the MMA warpgroup's cross-warp row max / row sum
+    # reductions through shared memory.
+    SwapABReduce = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

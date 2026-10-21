@@ -241,10 +241,21 @@ def _smem_bytes_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_stages
     return fixed_bytes + num_stages * stage_bytes
 
 
-def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+def _fits_two_ctas_sm90_native_fp8(
+    tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows=None, swap_ab_q_rows=None
+):
     """Two single-warpgroup CTAs (tile_m 64, hdim_v <= 128) fit per SM when a 2-stage
-    pipeline fits in half of the SM's shared memory."""
+    pipeline fits in half of the SM's shared memory. Swap-AB decode tiles (any hdim_v) use
+    their own shared-memory model."""
     budget = _SM90_SMEM_PER_SM_BYTES // 2 - _SM90_SMEM_RESERVED_PER_CTA_BYTES - 1024
+    if swap_ab_rows is not None:
+        return (
+            tile_m == 64
+            and _smem_bytes_sm90_native_fp8_swap_ab(
+                tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, 2, swap_ab_q_rows
+            )
+            <= budget
+        )
     return (
         tile_m == 64
         and head_dim_v <= 128
@@ -252,10 +263,91 @@ def _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
     )
 
 
-def _ctas_per_sm_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v, num_ctas, num_SMs):
-    if num_ctas > num_SMs and _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v):
+def _ctas_per_sm_sm90_native_fp8(
+    tile_m, tile_n, head_dim, head_dim_v, num_ctas, num_SMs, swap_ab_rows=None, swap_ab_q_rows=None
+):
+    """Two CTAs per SM when they fit and the grid exceeds one wave."""
+    if num_ctas > num_SMs and _fits_two_ctas_sm90_native_fp8(
+        tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, swap_ab_q_rows
+    ):
         return 2
     return 1
+
+
+# Swap-AB decode (S^T = K Q^T, O^T = V^T P^T): the live query rows of a KV head are the WGMMA N
+# dimension, so decode tiles carry no padded rows. Up to 64 rows, 4 K/V stages and 16 splits.
+_SM90_NATIVE_FP8_SWAP_AB_MAX_ROWS = 64
+_SM90_NATIVE_FP8_MAX_STAGES = 4
+_SM90_NATIVE_FP8_SWAP_AB_MAX_SPLITS = 16
+# Largest dynamic shared memory of one SM90 CTA.
+_SM90_MAX_SMEM_PER_CTA_BYTES = 227 * 1024
+
+
+def _swap_ab_rows_sm90_native_fp8(max_seqlen_q, qhead_per_kvhead, pack_gqa, head_dim_v):
+    """Rows of a swap-AB decode tile, or None. Applies when one M block holds every query row
+    of a KV head (query tokens x q heads per KV head <= 64) and hdim_v is a multiple of 32;
+    the rows are rounded up to the WGMMA N granularity of 8."""
+    rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+    if rows > _SM90_NATIVE_FP8_SWAP_AB_MAX_ROWS or head_dim_v % 32 != 0:
+        return None
+    return max(8, (rows + 7) // 8 * 8)
+
+
+def _swap_ab_q_rows_sm90_native_fp8(swap_ab_rows, qhead_per_kvhead, pack_gqa):
+    """Rows of the swap-AB Q tile in shared memory: the swap-AB rows, or None (a full 64-row
+    tile) when PackGQA rows would not hold whole query tokens."""
+    if swap_ab_rows is None or (pack_gqa and swap_ab_rows % qhead_per_kvhead != 0):
+        return None
+    return swap_ab_rows
+
+
+def _tile_size_fwd_sm90_native_fp8_swap_ab(
+    head_dim, head_dim_v, local, window_size_left, window_size_right
+):
+    """(tile_m, tile_n) of swap-AB decode. tile_m (64) only bounds the rows; KV tiles hold 128
+    keys, or 64 when d + dv > 256 (shared memory) or the window spans at most 256 keys (less
+    masked work)."""
+    short_window = (
+        local
+        and window_size_left is not None
+        and window_size_right is not None
+        and window_size_left + window_size_right + 1 <= 256
+    )
+    return 64, 128 if head_dim + head_dim_v <= 256 and not short_window else 64
+
+
+def _smem_bytes_sm90_native_fp8_swap_ab(
+    tile_m, tile_n, head_dim, head_dim_v, rows, num_stages, q_rows=None
+):
+    """Shared memory of a swap-AB CTA: the Q rows and P^T (1 KB aligned), the row reductions
+    (2 KB) and barriers, plus per stage K and row-major V (no K-major V copy)."""
+    fixed_bytes = (
+        ((q_rows if q_rows is not None else tile_m) * head_dim + 1023) // 1024 * 1024
+        + (rows * tile_n + 1023) // 1024 * 1024
+        + 2048
+        + 1024
+    )
+    return fixed_bytes + num_stages * tile_n * (head_dim + head_dim_v)
+
+
+def _num_stages_sm90_native_fp8(
+    tile_m, tile_n, head_dim, head_dim_v, ctas_per_sm, swap_ab_rows, swap_ab_q_rows=None
+):
+    """K/V pipeline stages: 2, or for swap-AB decode at one CTA per SM the deepest pipeline, up
+    to 4 stages, that fits in shared memory."""
+    if swap_ab_rows is None or ctas_per_sm == 2:
+        return 2
+    budget = _SM90_MAX_SMEM_PER_CTA_BYTES - _SM90_SMEM_RESERVED_PER_CTA_BYTES
+    num_stages = 2
+    while (
+        num_stages < _SM90_NATIVE_FP8_MAX_STAGES
+        and _smem_bytes_sm90_native_fp8_swap_ab(
+            tile_m, tile_n, head_dim, head_dim_v, swap_ab_rows, num_stages + 1, swap_ab_q_rows
+        )
+        <= budget
+    ):
+        num_stages += 1
+    return num_stages
 
 
 def _num_splits_sm90_native_fp8(
@@ -581,6 +673,8 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
     native_fp8: bool = False,
+    native_fp8_swap_ab_rows: Optional[int] = None,
+    native_fp8_swap_ab_q_rows: Optional[int] = None,
 ) -> FwdConfig:
     auto_splits = num_splits < 1
     if seqlen_q is None:
@@ -676,9 +770,26 @@ def _get_fwd_config(
             total_mblocks,
             num_n_blocks,
             num_SMs,
-            _fits_two_ctas_sm90_native_fp8(tile_m, tile_n, head_dim, head_dim_v),
+            _fits_two_ctas_sm90_native_fp8(
+                tile_m,
+                tile_n,
+                head_dim,
+                head_dim_v,
+                native_fp8_swap_ab_rows,
+                native_fp8_swap_ab_q_rows,
+            ),
             auto_splits,
         )
+        # Swap-AB decode: at most 16 splits; when the M blocks leave room for two or more
+        # splits each, keep the grid to one wave of CTAs. With a window, even the window's KV
+        # tiles out over the splits.
+        if native_fp8_swap_ab_rows is not None and auto_splits:
+            num_splits = min(num_splits, _SM90_NATIVE_FP8_SWAP_AB_MAX_SPLITS)
+            if total_mblocks * num_splits > num_SMs and num_SMs // max(1, total_mblocks) >= 2:
+                num_splits = num_SMs // total_mblocks
+            if local and num_splits > 1:
+                tiles_per_split = (num_n_blocks + num_splits - 1) // num_splits
+                num_splits = (num_n_blocks + tiles_per_split - 1) // tiles_per_split
 
     return FwdConfig(tile_m, tile_n, mma_pv_is_rs, intra_wg_overlap, q_stage, num_splits)
 
@@ -1205,10 +1316,34 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
+    native_fp8_swap_ab_rows = None
+    native_fp8_swap_ab_q_rows = None
 
     if native_fp8:
         # Native FP8 WGMMA requires RS PV; pick FA3's Hopper FP8 tiles unless overridden.
         mma_pv_is_rs = True
+        # Swap-AB decode (varlen Q with static max_seqlen_q, no score/mask mods, softcap,
+        # learnable sink, dynamic causal, block sparsity or aux tensors).
+        if (
+            tile_mn is None
+            and cu_seqlens_q is not None
+            and seqused_q is None
+            and isinstance(max_seqlen_q, int)
+            and score_mod is None
+            and mask_mod is None
+            and softcap is None
+            and learnable_sink is None
+            and dynamic_causal is None
+            and block_sparse_tensors is None
+            and aux_tensors is None
+        ):
+            native_fp8_swap_ab_rows = _swap_ab_rows_sm90_native_fp8(
+                max_seqlen_q, qhead_per_kvhead, pack_gqa, head_dim_v
+            )
+        if tile_mn is None and native_fp8_swap_ab_rows is not None:
+            tile_mn = _tile_size_fwd_sm90_native_fp8_swap_ab(
+                head_dim, head_dim_v, local, window_size_left, window_size_right
+            )
         if tile_mn is None:
             # d192 prefill uses 64-row tiles while those fit in one wave.
             rows_per_head = (max_seqlen_q if isinstance(max_seqlen_q, int) else total_q) * (
@@ -1229,6 +1364,11 @@ def _flash_attn_fwd(
         # Match FA3's paged non-TMA launch policy: K/V without TMA use the PackGQA Q/O copies.
         if page_table is not None and page_size != tile_mn[1]:
             pack_gqa = True
+    native_fp8_swap_ab_q_rows = (
+        _swap_ab_q_rows_sm90_native_fp8(native_fp8_swap_ab_rows, qhead_per_kvhead, pack_gqa)
+        if native_fp8
+        else None
+    )
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -1251,6 +1391,8 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
         native_fp8=native_fp8,
+        native_fp8_swap_ab_rows=native_fp8_swap_ab_rows,
+        native_fp8_swap_ab_q_rows=native_fp8_swap_ab_q_rows,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     # SM90 native FP8 paged KV whose page size differs from tile_n: load each KV tile as
@@ -1803,12 +1945,25 @@ def _flash_attn_fwd(
             head_dim_v,
             num_ctas,
             get_num_sms_for_selection(device.index, arch),
+            native_fp8_swap_ab_rows,
+            swap_ab_q_rows=native_fp8_swap_ab_q_rows,
+        )
+        native_fp8_num_stages = _num_stages_sm90_native_fp8(
+            tile_m,
+            tile_n,
+            head_dim,
+            head_dim_v,
+            native_fp8_ctas_per_sm,
+            native_fp8_swap_ab_rows,
+            native_fp8_swap_ab_q_rows,
         )
         compile_key += (
             native_fp8_one_m_block_per_batch,
             native_fp8_direct_3d_grid,
             native_fp8_ctas_per_sm,
             native_fp8_direct_m_blocks,
+            native_fp8_swap_ab_rows,
+            native_fp8_num_stages,
         )
     if use_dedicated_hd256_kernel:
         compile_key += (
@@ -1949,7 +2104,13 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1 if any(d > 256 for d in [head_dim, head_dim_v]) else 2,
+                num_stages=(
+                    native_fp8_num_stages
+                    if native_fp8
+                    else 1
+                    if any(d > 256 for d in [head_dim, head_dim_v])
+                    else 2
+                ),
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1971,6 +2132,7 @@ def _flash_attn_fwd(
                 native_fp8_direct_3d_grid=native_fp8_direct_3d_grid,
                 native_fp8_ctas_per_sm=native_fp8_ctas_per_sm,
                 native_fp8_direct_m_blocks=native_fp8_direct_m_blocks,
+                native_fp8_swap_ab_rows=native_fp8_swap_ab_rows,
             )
         elif arch // 10 in [10, 11]:
             if output_quant_key is not None:
