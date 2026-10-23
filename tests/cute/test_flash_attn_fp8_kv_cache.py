@@ -63,6 +63,7 @@ def _cute_dequant_paged_attention(
     v_scale: torch.Tensor,
     softmax_scale: float = GEMMA4_SOFTMAX_SCALE,
     num_splits: int = 1,
+    expand_descales: bool = False,
 ) -> torch.Tensor:
     """Run the SM90 fp16/bf16-Q + fp8-KV-cache dequant forward (-> O matching Q dtype).
 
@@ -80,8 +81,13 @@ def _cute_dequant_paged_attention(
     ).cumsum(dim=0, dtype=torch.int32)
     kv_lens_t = torch.tensor(kv_lens, device=query.device, dtype=torch.int32)
     scale_shape = (num_seqs, num_kv_heads)
-    k_descale = torch.full(scale_shape, k_scale.item(), device=query.device, dtype=torch.float32)
-    v_descale = torch.full(scale_shape, v_scale.item(), device=query.device, dtype=torch.float32)
+    if expand_descales:
+        # vLLM expands its 0-d per-tensor scales to (num_seqs, num_kv_heads): all strides 0.
+        k_descale = k_scale.float().reshape(()).expand(scale_shape)
+        v_descale = v_scale.float().reshape(()).expand(scale_shape)
+    else:
+        k_descale = torch.full(scale_shape, k_scale.item(), device=query.device, dtype=torch.float32)
+        v_descale = torch.full(scale_shape, v_scale.item(), device=query.device, dtype=torch.float32)
     out = _cute_flash_attn_fwd(
         q=query,
         k=key_cache_fp8,
@@ -662,6 +668,33 @@ def test_gemma4_fp16q_fp8kv_dequant_splitkv_matches_reference(qo_dtype: torch.dt
         cute_split, cute_nosplit, atol=SPLITKV_SELF_ATOL, rtol=SPLITKV_SELF_RTOL,
         check_dtype=False,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_gemma4_fp16q_fp8kv_dequant_broadcast_descales():
+    """One sequence and one KV head (Gemma4 TP4 decode): the expanded (1, 1) K/V descales
+    have stride 0 on both dimensions and must give the same output as materialized ones."""
+    if _cute_flash_attn_fwd is None:
+        pytest.skip("FA4 CuTe interface is not importable in this environment")
+
+    attention_case = AttentionCase(
+        id="one_seq_one_kv_head_decode",
+        num_query_heads=2,
+        num_kv_heads=1,
+        head_size=512,
+        block_size=64,
+        query_lens=(1,),
+        kv_lens=(129,),
+    )
+    ins = _build_case_inputs(attention_case, SCALE_CASES[1])
+    args = (
+        ins["query"].half(), ins["key_cache_fp8"], ins["value_cache_fp8"],
+        ins["query_lens"], ins["kv_lens"], ins["page_table"], ins["k_scale"], ins["v_scale"],
+    )
+    out_materialized = _cute_dequant_paged_attention(*args)
+    out_broadcast = _cute_dequant_paged_attention(*args, expand_descales=True)
+    assert torch.equal(out_broadcast, out_materialized)
 
 
 # ===========================================================================
